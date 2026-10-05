@@ -1,0 +1,13 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Category": "System Information",
+        "Description": "Live view and settings for the webcam presence sensor",
+        "EnabledByDefault": false,
+        "Icon": "user-available-symbolic",
+        "Id": "asus-presence",
+        "Name": "Presence Sensor",
+        "Version": "0.1"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

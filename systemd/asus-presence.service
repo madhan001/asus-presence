@@ -1,0 +1,43 @@
+[Unit]
+Description=Webcam human-presence sensor (asus-presence)
+Documentation=https://github.com/madhan001/asus-presence
+After=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/asus-presence-sensord
+Restart=on-failure
+RestartSec=5
+Nice=10
+# State and control files live here: root:asus-presence 0750. Kept across
+# restarts so the session agent's inotify watch stays valid.
+Group=asus-presence
+RuntimeDirectory=asus-presence
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+UMask=0027
+# Hardening: needs only sysfs (iio buffer/scan settings), /dev/iio:device*,
+# and its own runtime directory. Root with no capabilities.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+DevicePolicy=closed
+DeviceAllow=char-iio rw
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

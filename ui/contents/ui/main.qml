@@ -1,0 +1,406 @@
+import QtQuick
+import QtQuick.Controls as QQC2
+import QtQuick.Layouts
+
+import org.kde.kirigami as Kirigami
+import org.kde.plasma.components as PlasmaComponents3
+import org.kde.plasma.core as PlasmaCore
+import org.kde.plasma.extras as PlasmaExtras
+import org.kde.plasma.plasma5support as Plasma5Support
+import org.kde.plasma.plasmoid
+
+// Live view and settings for the webcam presence sensor. Meant to be opened in
+// its own window (plasmawindowed asus-presence); it only polls while shown.
+PlasmoidItem {
+    id: root
+
+    readonly property string ctl: "/usr/local/bin/asus-presence-ctl"
+    readonly property int historySeconds: 120
+
+    property var st: ({})
+    property var history: []        // [{t, distance, present, attention}]
+    property bool busy: false
+    property string lastError: ""
+
+    readonly property var sensor: st.sensor || {}
+    readonly property var agent: st.agent || {}
+    readonly property var cfg: agent.config || {}
+    readonly property bool serviceOn: st.service === "active"
+    readonly property bool ready: serviceOn && sensor.sensor_ready === true
+
+    preferredRepresentation: fullRepresentation
+    Plasmoid.icon: sensor.present ? "user-available-symbolic" : "user-away-symbolic"
+
+    function refresh() {
+        runner.connectSource(ctl + " get");
+    }
+
+    function run(command) {
+        busy = true;
+        runner.connectSource(command);
+    }
+
+    function setting(key, value) {
+        run(ctl + " set " + key + " " + value);
+    }
+
+    function ago(t) {
+        if (!t) {
+            return "";
+        }
+        const s = Math.max(0, Math.round(Date.now() / 1000 - t));
+        return s < 60 ? s + " s ago" : s < 3600 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago";
+    }
+
+    function statusText() {
+        if (!serviceOn) {
+            return "Sensor service is off";
+        }
+        if (sensor.mode === "standby") {
+            return "Sensor in standby";
+        }
+        if (!sensor.sensor_ready) {
+            return "Starting sensor…";
+        }
+        if (!sensor.present) {
+            return "Away";
+        }
+        return sensor.attention ? "Present · looking at the screen" : "Present · looking away";
+    }
+
+    function since() {
+        if (!ready) {
+            return "";
+        }
+        if (!sensor.present) {
+            return "since " + ago(sensor.away_since);
+        }
+        return sensor.attention ? "since " + ago(sensor.attention_since) : "since " + ago(sensor.looking_away_since);
+    }
+
+    Plasma5Support.DataSource {
+        id: runner
+        engine: "executable"
+        interval: 0
+        onNewData: function(source, data) {
+            runner.disconnectSource(source);
+            const out = (data["stdout"] || "").toString();
+            if (source === root.ctl + " get") {
+                try {
+                    root.st = JSON.parse(out);
+                    const s = root.st.sensor || {};
+                    const now = Date.now() / 1000;
+                    const h = root.history.filter(p => now - p.t < root.historySeconds);
+                    h.push({ t: now, distance: s.sensor_ready && s.present ? s.distance_mm : null,
+                             present: !!(s.sensor_ready && s.present), attention: !!(s.sensor_ready && s.attention),
+                             dimmed: !!(root.st.agent && root.st.agent.dimmed) });
+                    root.history = h;
+                } catch (e) {
+                    root.lastError = "Could not read state: " + e;
+                }
+            } else {
+                root.busy = false;
+                root.lastError = data["exit code"] ? (data["stderr"] || "").toString().trim() : "";
+                root.refresh();
+            }
+        }
+    }
+
+    fullRepresentation: PlasmaExtras.Representation {
+        Layout.minimumWidth: Kirigami.Units.gridUnit * 24
+        Layout.preferredWidth: Kirigami.Units.gridUnit * 26
+        Layout.minimumHeight: content.implicitHeight + header.implicitHeight + Kirigami.Units.largeSpacing * 2
+        collapseMarginsHint: true
+
+        header: PlasmaExtras.PlasmoidHeading {
+            id: header
+            RowLayout {
+                anchors.fill: parent
+                spacing: Kirigami.Units.smallSpacing
+
+                Kirigami.Heading {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: Kirigami.Units.smallSpacing
+                    text: "Presence Sensor"
+                    level: 1
+                }
+                PlasmaComponents3.BusyIndicator {
+                    visible: root.busy
+                    running: root.busy
+                    Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
+                    Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
+                }
+                PlasmaComponents3.Switch {
+                    Layout.rightMargin: Kirigami.Units.smallSpacing
+                    text: "Sensor service"
+                    checked: root.serviceOn
+                    enabled: !root.busy
+                    // Enabling a system service asks for authentication (polkit).
+                    onToggled: root.run("systemctl " + (checked ? "enable --now" : "disable --now")
+                                        + " asus-presence.service")
+                }
+            }
+        }
+
+        // Test tool: poll only while this view is actually shown.
+        Timer {
+            interval: 500
+            repeat: true
+            running: content.visible && content.Window.window !== null && content.Window.window.visible
+            triggeredOnStart: true
+            onTriggered: root.refresh()
+        }
+
+        ColumnLayout {
+            id: content
+            anchors.fill: parent
+            anchors.margins: Kirigami.Units.largeSpacing
+            spacing: Kirigami.Units.largeSpacing * 2
+
+            Kirigami.InlineMessage {
+                Layout.fillWidth: true
+                visible: root.lastError.length > 0
+                type: Kirigami.MessageType.Error
+                text: root.lastError
+            }
+
+            Kirigami.InlineMessage {
+                Layout.fillWidth: true
+                visible: root.st.agent_service !== undefined && root.st.agent_service !== "active"
+                type: Kirigami.MessageType.Warning
+                text: "The presence agent is not running, so nothing will lock or dim. Start it with: systemctl --user enable --now asus-presence-agent"
+            }
+
+            // Live status -------------------------------------------------
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Kirigami.Units.gridUnit
+
+                Kirigami.Icon {
+                    Layout.alignment: Qt.AlignTop
+                    Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+                    Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+                    source: !root.ready ? "camera-web-symbolic"
+                          : !root.sensor.present ? "user-away-symbolic"
+                          : root.sensor.attention ? "view-visible-symbolic" : "view-hidden-symbolic"
+                    opacity: root.ready ? 1 : 0.5
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.smallSpacing / 2
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        PlasmaComponents3.Label {
+                            Layout.fillWidth: true
+                            text: root.statusText()
+                            font.weight: Font.DemiBold
+                        }
+                        PlasmaComponents3.Label {
+                            visible: root.ready && root.sensor.present
+                            text: root.sensor.distance_mm ? Math.round(root.sensor.distance_mm / 10) + " cm" : ""
+                            opacity: 0.7
+                        }
+                    }
+                    PlasmaComponents3.Label {
+                        Layout.fillWidth: true
+                        text: [root.since(),
+                               root.sensor.sensor ? root.sensor.sensor + " · " + root.sensor.rate_hz + " Hz · " + root.sensor.mode : ""]
+                              .filter(t => t.length > 0).join("  ·  ")
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.7
+                        elide: Text.ElideRight
+                    }
+                }
+            }
+
+            // History -----------------------------------------------------
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: Kirigami.Units.smallSpacing
+
+                Canvas {
+                    id: graph
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: Kirigami.Units.gridUnit * 6
+                    readonly property real maxMm: 1500
+                    readonly property var points: root.history
+                    onPointsChanged: requestPaint()
+
+                    onPaint: {
+                        const ctx = getContext("2d");
+                        const w = width, h = height, band = Kirigami.Units.smallSpacing * 1.5;
+                        const plotH = h - 2 * band - 2;
+                        ctx.reset();
+                        const now = Date.now() / 1000;
+                        const x = t => w - (now - t) / root.historySeconds * w;
+                        const tc = Kirigami.Theme.textColor;
+                        // frame and 50 cm / 100 cm guides
+                        ctx.strokeStyle = Qt.rgba(tc.r, tc.g, tc.b, 0.15);
+                        ctx.lineWidth = 1;
+                        for (const mm of [500, 1000]) {
+                            const y = plotH - mm / maxMm * plotH;
+                            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+                        }
+                        const pts = root.history;
+                        // presence / attention / dimmed bands along the bottom
+                        for (let i = 1; i < pts.length; i++) {
+                            const x0 = x(pts[i - 1].t), x1 = x(pts[i].t);
+                            if (pts[i].present) {
+                                ctx.fillStyle = Qt.rgba(Kirigami.Theme.positiveTextColor.r, Kirigami.Theme.positiveTextColor.g, Kirigami.Theme.positiveTextColor.b, 0.6);
+                                ctx.fillRect(x0, plotH + 2, x1 - x0, band);
+                            }
+                            if (pts[i].attention) {
+                                ctx.fillStyle = Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.6);
+                                ctx.fillRect(x0, plotH + 2 + band, x1 - x0, band);
+                            }
+                        }
+                        // distance line
+                        ctx.strokeStyle = Kirigami.Theme.highlightColor;
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        let drawing = false;
+                        for (const p of pts) {
+                            if (p.distance === null || p.distance === undefined) { drawing = false; continue; }
+                            const y = plotH - Math.min(p.distance, maxMm) / maxMm * plotH;
+                            if (drawing) { ctx.lineTo(x(p.t), y); } else { ctx.moveTo(x(p.t), y); drawing = true; }
+                        }
+                        ctx.stroke();
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    PlasmaComponents3.Label {
+                        Layout.fillWidth: true
+                        text: "Distance (lines at 50 and 100 cm) · green: present · blue: looking"
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.7
+                        elide: Text.ElideRight
+                    }
+                    PlasmaComponents3.Label {
+                        text: "last 2 min"
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.7
+                    }
+                }
+            }
+
+            // Agent -------------------------------------------------------
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Kirigami.Units.gridUnit
+
+                Kirigami.Icon {
+                    Layout.alignment: Qt.AlignTop
+                    Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+                    Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+                    source: "system-lock-screen-symbolic"
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.smallSpacing
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        PlasmaComponents3.Label {
+                            Layout.fillWidth: true
+                            text: "Adaptive lock and dimming"
+                        }
+                        PlasmaComponents3.Switch {
+                            checked: root.cfg.enabled !== false
+                            enabled: !root.busy
+                            onToggled: root.setting("enabled", checked)
+                        }
+                    }
+                    PlasmaComponents3.Label {
+                        Layout.fillWidth: true
+                        text: [root.agent.dimmed ? "Screen dimmed by presence" : "",
+                               root.agent.screen_held ? "Keeping the screen on"
+                                   : root.agent.sleep_held ? "Preventing sleep" : "",
+                               root.agent.last_action ? "Last: " + root.agent.last_action + " (" + root.ago(root.agent.last_action_at) + ")" : "No actions yet",
+                               root.agent.inhibited ? "Paused: an app is inhibiting idle" : ""]
+                              .filter(t => t.length > 0).join("  ·  ")
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.7
+                        wrapMode: Text.Wrap
+                    }
+
+                    GridLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: Kirigami.Units.smallSpacing
+                        columns: 3
+                        columnSpacing: Kirigami.Units.smallSpacing
+                        rowSpacing: Kirigami.Units.smallSpacing
+                        enabled: root.cfg.enabled !== false && !root.busy
+
+                        PlasmaComponents3.CheckBox {
+                            text: "Lock when away for"
+                            checked: root.cfg.lock !== false
+                            onToggled: root.setting("lock", checked)
+                        }
+                        PlasmaComponents3.SpinBox {
+                            from: 10; to: 3600; stepSize: 10
+                            value: root.cfg.lock_after || 60
+                            onValueModified: root.setting("lock_after", value)
+                        }
+                        PlasmaComponents3.Label { text: "seconds" }
+
+                        PlasmaComponents3.CheckBox {
+                            text: "Dim when looking away for"
+                            checked: root.cfg.dim !== false
+                            onToggled: root.setting("dim", checked)
+                        }
+                        PlasmaComponents3.SpinBox {
+                            from: 3; to: 600
+                            value: root.cfg.dim_after || 10
+                            onValueModified: root.setting("dim_after", value)
+                        }
+                        PlasmaComponents3.Label { text: "seconds" }
+
+                        PlasmaComponents3.Label {
+                            Layout.alignment: Qt.AlignRight
+                            text: "Dim to"
+                        }
+                        PlasmaComponents3.SpinBox {
+                            from: 5; to: 90; stepSize: 5
+                            value: root.cfg.dim_level || 30
+                            onValueModified: root.setting("dim_level", value)
+                        }
+                        PlasmaComponents3.Label { text: "% brightness" }
+
+                        PlasmaComponents3.CheckBox {
+                            Layout.columnSpan: 3
+                            text: "Keep the screen on while I'm looking at it"
+                            checked: root.cfg.keep_screen_on !== false
+                            onToggled: root.setting("keep_screen_on", checked)
+                        }
+
+                        // Keeping the screen on also blocks sleep (Plasma ties the two),
+                        // so this only matters on its own.
+                        PlasmaComponents3.CheckBox {
+                            Layout.columnSpan: 3
+                            readonly property bool implied: root.cfg.keep_screen_on !== false
+                            text: implied ? "Don't sleep while I'm looking at the screen (included above)"
+                                          : "Don't sleep while I'm looking at the screen"
+                            enabled: !implied
+                            checked: implied || root.cfg.prevent_sleep !== false
+                            onToggled: root.setting("prevent_sleep", checked)
+                        }
+
+                        PlasmaComponents3.CheckBox {
+                            Layout.columnSpan: 3
+                            text: "Wake the screen when I return (keeps the sensor on while locked)"
+                            checked: root.cfg.wake_on_return === true
+                            onToggled: root.setting("wake_on_return", checked)
+                        }
+                    }
+                }
+            }
+
+            Item { Layout.fillHeight: true }
+        }
+    }
+}

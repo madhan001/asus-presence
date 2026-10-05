@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""asus-presence-sensord: stream a webcam's human-presence sensor and publish its state.
+
+Some laptop webcams (e.g. the ASUS FHD webcam, USB 3277:0059, on ASUS
+"AI camera" models) carry a HID sensor hub with Human Presence sensors.
+hid_sensor_prox exposes them as iio "prox" devices with presence, distance
+and attention channels (attention needs Linux 6.13 or newer). The sensor
+only reports while it is kept streaming through the iio buffer: a one-shot
+sysfs read powers it on and off before it has a sample (~6.5 s start-up).
+Some webcams expose two such sensors of which only one reports, so each
+candidate is probed and the first that delivers samples is used.
+
+Runs as root (the iio buffer and /dev/iio:deviceN are root-only), with no
+capabilities; see asus-presence.service.
+
+Power: the camera's USB link runtime-suspends while the sensor is off, so the
+sensor is only streamed in "active" mode and at a low rate (2 Hz). The loop
+blocks on the sensor fd and an inotify watch on the control directory, so
+there is no timer polling; it wakes only for samples or a mode change.
+
+Noise: presence and attention must hold for CONFIRM_SAMPLES consecutive
+samples before they change (a one-sample blip neither restores a dimmed
+screen nor restarts a timer); the *_since timestamps still record the first
+sample of the new state. Distance has hysteresis so jitter does not rewrite
+the file (each write wakes the session agent).
+
+Privacy: whether you are at the desk is personal, so the state is readable
+only by root and the service's group (asus-presence).
+
+Files (RUN_DIR is the service's RuntimeDirectory, root:asus-presence 0750):
+  state.json     published state, mode 0640 (written only when it changes)
+  control/mode   "active" (default) or "standby" (sensor off); the control
+                 directory is group-writable so the session agent can switch
+                 the sensor without root
+"""
+
+import ctypes
+import ctypes.util
+import glob
+import json
+import os
+import re
+import select
+import signal
+import stat
+import struct
+import sys
+import time
+
+RUN_DIR = os.environ.get("RUNTIME_DIRECTORY", "/run/asus-presence")
+STATE_FILE = RUN_DIR + "/state.json"
+CTL_DIR = RUN_DIR + "/control"   # watched; group-writable, holds only the mode file
+MODE_FILE = CTL_DIR + "/mode"
+SAMPLE_HZ = float(os.environ.get("ASUS_PRESENCE_HZ", "2"))
+DEVICE_OVERRIDE = os.environ.get("ASUS_PRESENCE_IIO")  # e.g. "iio:device1"
+PROBE_TIMEOUT = 15.0   # a working sensor delivers its first sample in ~6.5 s
+RETRY_MIN, RETRY_MAX = 2.0, 120.0   # back-off while no working sensor is found
+CONFIRM_SAMPLES = 2    # consecutive samples needed to change present/attention (1 s at 2 Hz)
+DISTANCE_STEP = 50     # mm; published distance is rounded to this
+DISTANCE_HYSTERESIS = 75  # mm the raw distance must move before it is republished
+STATE_MODE = 0o640
+
+IN_CLOSE_WRITE = 0x08
+IN_MOVED_TO = 0x80
+IN_NONBLOCK = 0x800
+
+
+class Stop(Exception):
+    pass
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def read(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def write(path, value):
+    with open(path, "w") as f:
+        f.write(str(value))
+
+
+class Inotify:
+    """Minimal inotify (stdlib only) for one directory."""
+
+    def __init__(self, directory, mask):
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        self.fd = libc.inotify_init1(IN_NONBLOCK)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1")
+        if libc.inotify_add_watch(self.fd, directory.encode(), mask) < 0:
+            raise OSError(ctypes.get_errno(), "inotify_add_watch")
+
+    def drain(self):
+        """Return the names of files changed since the last call."""
+        names = set()
+        while True:
+            try:
+                buf = os.read(self.fd, 4096)
+            except BlockingIOError:
+                return names
+            i = 0
+            while i + 16 <= len(buf):
+                _, _, _, length = struct.unpack_from("iIII", buf, i)
+                names.add(buf[i + 16:i + 16 + length].rstrip(b"\0").decode())
+                i += 16 + length
+
+
+def usb_id(real_path):
+    """USB vendor:product of the device an iio path hangs off, or None."""
+    m = re.search(r"/(\d+-[\d.]+)/\d+-[\d.]+:[\d.]+/", real_path)
+    if not m:
+        return None
+    try:
+        return "%s:%s" % (read("/sys/bus/usb/devices/%s/idVendor" % m.group(1)),
+                          read("/sys/bus/usb/devices/%s/idProduct" % m.group(1)))
+    except OSError:
+        return None
+
+
+def find_sensors():
+    """Candidate presence sensors, most likely to work first.
+
+    A candidate is an iio "prox" device with a streamable attention channel.
+    Higher HID sensor instances come first: on the ASUS webcam the reporting
+    engine is the higher-numbered of its two Human Presence sensors.
+    """
+    if DEVICE_OVERRIDE:
+        return ["/sys/bus/iio/devices/" + DEVICE_OVERRIDE]
+    candidates = []
+    for dev in glob.glob("/sys/bus/iio/devices/iio:device*"):
+        try:
+            if read(dev + "/name") != "prox" or not os.path.exists(dev + "/scan_elements/in_attention_en"):
+                continue
+        except OSError:
+            continue
+        inst = re.search(r"HID-SENSOR-200011\.(\d+)\.auto", os.path.realpath(dev))
+        candidates.append((int(inst.group(1)) if inst else -1, dev))
+    return [dev for _, dev in sorted(candidates, reverse=True)]
+
+
+def channel_layout(dev):
+    chans = []
+    for f in os.listdir(dev + "/scan_elements"):
+        if not f.endswith("_en"):
+            continue
+        name = f[:-3]
+        idx = int(read("%s/scan_elements/%s_index" % (dev, name)))
+        m = re.match(r"([bl])e:([su])(\d+)/(\d+)>>(\d+)", read("%s/scan_elements/%s_type" % (dev, name)))
+        chans.append((idx, name, m.group(1), m.group(2), int(m.group(4)) // 8, int(m.group(5))))
+    chans.sort()
+    size = 0
+    for chan in chans:
+        nb = chan[4]
+        size = (size + nb - 1) // nb * nb + nb
+    return chans, size
+
+
+def decode(chans, rec):
+    vals, off = {}, 0
+    for _, name, endian, sign, nb, shift in chans:
+        off = (off + nb - 1) // nb * nb
+        raw = int.from_bytes(rec[off:off + nb], "little" if endian == "l" else "big", signed=(sign == "s"))
+        vals[name] = raw >> shift
+        off += nb
+    return vals
+
+
+class Debounced:
+    """A boolean that only changes after `samples` consecutive agreeing samples."""
+
+    def __init__(self, value, samples=CONFIRM_SAMPLES):
+        self.value = value
+        self.samples = samples
+        self.count = 0
+        self.first = None   # time of the first sample of the pending change
+
+    def feed(self, raw, now):
+        """Feed one sample; return the time the change began if it is now confirmed."""
+        if raw == self.value:
+            self.count = 0
+            return None
+        if self.count == 0:
+            self.first = now
+        self.count += 1
+        if self.count < self.samples:
+            return None
+        self.value, self.count = raw, 0
+        return self.first
+
+
+class Presence:
+    def __init__(self):
+        self.state = {
+            "mode": "active", "sensor": None, "present_since": None, "attention_since": None,
+            "rate_hz": SAMPLE_HZ, "pid": os.getpid(),
+        }
+        self.published = None
+        self.reset()   # fills the sensor fields
+
+    def reset(self):
+        """Forget sensor history (stream stopped or restarting).
+
+        The away/looking-away clocks restart too: time spent with the sensor
+        off (e.g. locked) must not count as time away once it is back.
+        """
+        self.present = Debounced(False)
+        self.attention = Debounced(False)
+        self.raw_distance = None
+        self.samples = 0
+        now = time.time()
+        self.state.update(sensor_ready=False, present=False, attention=False, distance_mm=None,
+                          away_since=now, looking_away_since=now)
+
+    def publish(self):
+        """Write the state file, but only if something changed."""
+        if self.state == self.published:
+            return
+        self.state["changed"] = time.time()
+        tmp = STATE_FILE + ".tmp"
+        # Create with the final mode: never briefly world-readable.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, STATE_MODE)
+        os.fchmod(fd, STATE_MODE)
+        with os.fdopen(fd, "w") as f:
+            json.dump(self.state, f)
+        os.replace(tmp, STATE_FILE)
+        self.published = dict(self.state)
+        del self.state["changed"]
+        self.published.pop("changed", None)
+
+    def update(self, vals, now):
+        s = self.state
+        raw_present = bool(vals.get("in_proximity0", 0))
+        changed_at = self.present.feed(raw_present, now)
+        if changed_at is not None:
+            s["present"] = self.present.value
+            s["present_since" if s["present"] else "away_since"] = changed_at
+        # Attention only counts while present (debounced separately, so a
+        # flicker of either input cannot flip it on its own).
+        changed_at = self.attention.feed(raw_present and bool(vals.get("in_attention", 0)), now)
+        if changed_at is not None:
+            s["attention"] = self.attention.value
+            s["attention_since" if s["attention"] else "looking_away_since"] = changed_at
+        if s["attention"] and not s["present"]:
+            # Presence was lost first; looking away began then.
+            s["attention"] = False
+            s["looking_away_since"] = s["away_since"]
+            self.attention = Debounced(False)
+        # Distance is shown in the test UI only: publish it in DISTANCE_STEP
+        # steps, and only when it moves past the hysteresis band, so jitter
+        # does not rewrite the file (and wake its readers).
+        if not s["present"]:
+            self.raw_distance = None
+            s["distance_mm"] = None
+        else:
+            raw = vals.get("in_proximity1", 0)
+            if self.raw_distance is None or abs(raw - self.raw_distance) >= DISTANCE_HYSTERESIS:
+                self.raw_distance = raw
+                s["distance_mm"] = int(round(raw / float(DISTANCE_STEP))) * DISTANCE_STEP
+        # Ready once the debounce has seen enough samples to have an opinion.
+        self.samples += 1
+        s["sensor_ready"] = self.samples >= CONFIRM_SAMPLES
+
+
+def wanted_mode():
+    """The requested mode. The control directory is writable by the group, so
+    read defensively: no symlinks, regular files only, a few bytes at most."""
+    try:
+        fd = os.open(MODE_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return "active"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "active"
+        mode = os.read(fd, 16).decode(errors="replace").strip()
+    finally:
+        os.close(fd)
+    return mode if mode in ("active", "standby") else "active"
+
+
+class NoData(Exception):
+    """The sensor streamed nothing within PROBE_TIMEOUT."""
+
+
+def run(presence, notify):
+    """Main loop: stream in active mode, idle (fully blocked) in standby."""
+    retry = RETRY_MIN
+    working = None   # the device that last delivered samples; tried first, without probing
+    while True:
+        if wanted_mode() == "standby":
+            presence.state["mode"] = "standby"
+            presence.reset()
+            presence.publish()
+            log("standby: sensor off")
+            wait([notify.fd], None)
+            notify.drain()
+            continue
+        presence.state["mode"] = "active"
+
+        candidates = find_sensors()
+        if working in candidates:
+            candidates.remove(working)
+            candidates.insert(0, working)
+        found = False
+        for dev in candidates:
+            name = os.path.basename(dev)
+            try:
+                stream(dev, presence, notify, probe=(dev != working))
+                working, found = dev, True     # returned: the mode changed
+                break
+            except NoData:
+                log("%s delivered no samples in %gs; trying the next sensor" % (name, PROBE_TIMEOUT))
+            except OSError as e:
+                log("sensor %s unavailable: %s" % (name, e))
+                if presence.samples:
+                    # It was working: the webcam re-enumerates on USB resets
+                    # and resume. Give it a moment, then look again.
+                    working, found = dev, True
+                    wait([notify.fd], RETRY_MIN)
+                    notify.drain()
+                    break
+        if found:
+            retry = RETRY_MIN
+            continue
+
+        if not candidates:
+            log("no presence sensor with an attention channel found")
+        presence.reset()
+        presence.state["sensor"] = None
+        presence.publish()
+        # Back off, so a laptop without a working sensor is not kept awake.
+        wait([notify.fd], retry)
+        notify.drain()
+        retry = min(retry * 2, RETRY_MAX)
+
+
+def wait(fds, timeout):
+    """Block until one of fds is readable (or timeout); raise Stop on SIGTERM/SIGINT."""
+    r, _, _ = select.select(list(fds) + [STOPPER_R], [], [], timeout)
+    if STOPPER_R in r:
+        raise Stop()
+    return r
+
+
+def stream(dev, presence, notify, probe=False):
+    """Stream dev until the mode changes (returns) or it fails (raises).
+
+    probe: raise NoData if no sample arrives within PROBE_TIMEOUT.
+    """
+    chans, size = channel_layout(dev)
+    name = os.path.basename(dev)
+    write(dev + "/in_attention_sampling_frequency", SAMPLE_HZ)  # shared report interval
+    for chan in chans:
+        write("%s/scan_elements/%s_en" % (dev, chan[1]), 1)
+    write(dev + "/buffer/length", 16)
+    write(dev + "/buffer/enable", 1)
+    fd = os.open("/dev/" + name, os.O_RDONLY | os.O_NONBLOCK)
+    presence.reset()
+    presence.state["sensor"] = name
+    presence.publish()
+    # The USB ID goes in the log so reports from other models are easy to collect.
+    log("streaming %s (USB %s) at %g Hz" % (name, usb_id(os.path.realpath(dev)) or "unknown", SAMPLE_HZ))
+    deadline = time.monotonic() + PROBE_TIMEOUT if probe else None
+    try:
+        while True:
+            timeout = None
+            if deadline is not None and not presence.samples:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise NoData()
+            r = wait([fd, notify.fd], timeout)
+            if notify.fd in r:
+                notify.drain()
+                if wanted_mode() != "active":
+                    return
+            if fd in r:
+                data = os.read(fd, size * 16)
+                now = time.time()
+                for k in range(0, len(data) - size + 1, size):
+                    presence.update(decode(chans, data[k:k + size]), now)
+                presence.publish()
+    finally:
+        try:
+            write(dev + "/buffer/enable", 0)
+        except OSError:
+            pass
+        os.close(fd)
+        log("released %s" % name)
+
+
+STOPPER_R, STOPPER_W = os.pipe()
+
+
+def main():
+    # The agent (a member of the service's group) switches the sensor by
+    # writing control/mode, so that directory is group-writable.
+    os.makedirs(CTL_DIR, exist_ok=True)
+    os.chmod(CTL_DIR, 0o770)
+    if os.getegid() == 0:
+        log("no Group= set for the service: %s is readable by root only" % STATE_FILE)
+    signal.signal(signal.SIGTERM, lambda *_: os.write(STOPPER_W, b"x"))
+    signal.signal(signal.SIGINT, lambda *_: os.write(STOPPER_W, b"x"))
+    presence = Presence()
+    notify = Inotify(CTL_DIR, IN_CLOSE_WRITE | IN_MOVED_TO)
+    try:
+        run(presence, notify)
+    except Stop:
+        pass
+    presence.reset()
+    presence.state.update(sensor=None, mode="stopped")
+    presence.publish()
+    log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

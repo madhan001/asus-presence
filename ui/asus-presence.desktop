@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Presence Sensor
+Comment=Live view and settings for the webcam presence sensor
+Exec=plasmawindowed asus-presence
+Icon=user-available-symbolic
+Categories=Settings;HardwareSettings;
+Terminal=false

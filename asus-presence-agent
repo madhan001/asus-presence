@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""asus-presence-agent: act on the webcam presence sensor in the user session.
+
+Reads the state published by the asus-presence service (asus-presence-sensord)
+and, per ~/.config/asus-presence/presence.conf:
+  * locks the session after you have been away for `lock_after` seconds,
+  * dims the built-in screen after you have looked away for `dim_after`
+    seconds and restores it when you look back,
+  * while you are looking at the screen, keeps it on (no idle dim, blank
+    or lock; this also prevents sleep) and/or prevents only sleep, by
+    holding Plasma inhibitions,
+  * optionally wakes the screen when you return to a locked session.
+
+It also puts the sensor in standby while the session is locked (unless
+wake_on_return needs it), so the webcam's USB link can suspend. It does that
+by writing the service's group-writable control file: no root needed.
+
+Targets KDE Plasma 6 (org.kde.ScreenBrightness, PowerDevil's PolicyAgent).
+
+Event-driven: blocks on inotify (sensor state, config), the screen-saver's
+ActiveChanged D-Bus signal, and the next decision deadline. No polling.
+
+The decision logic is the pure function `decide()`; everything with side
+effects lives in `Session`.
+"""
+
+import configparser
+import ctypes
+import ctypes.util
+import json
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field, replace
+
+try:
+    import dbus   # python3-dbus; optional so the pure policy stays testable without it
+except ImportError:
+    dbus = None
+
+RUN_DIR = "/run/asus-presence"
+STATE_FILE = RUN_DIR + "/state.json"
+MODE_FILE = RUN_DIR + "/control/mode"
+CONFIG_FILE = os.path.expanduser("~/.config/asus-presence/presence.conf")
+AGENT_FILE = os.path.expanduser("~/.cache/asus-presence/agent.json")
+APP_NAME = "ASUS Presence"   # shown in Plasma's battery applet while an inhibition is held
+INHIBIT_RETRY = 30.0  # seconds before re-checking when an inhibitor blocked an action
+LOOK_GRACE = 30.0  # keep-on / no-sleep last this long after you look away
+
+
+# ----------------------------------------------------------------- config ---
+
+@dataclass(frozen=True)
+class Config:
+    enabled: bool = True
+    lock: bool = True
+    lock_after: int = 60       # seconds away before locking
+    dim: bool = True
+    dim_after: int = 10        # seconds looking away (while present) before dimming
+    dim_level: int = 30        # percent of maximum brightness
+    keep_screen_on: bool = True  # no idle dim/blank/lock (nor sleep) while you look at the screen
+    prevent_sleep: bool = True   # no idle sleep while you look at the screen
+    wake_on_return: bool = False
+
+    LIMITS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90)}
+
+
+def load_config(path=CONFIG_FILE, log=print):
+    """Read the INI config, clamping numbers to sane ranges; never raises."""
+    cfg = Config()
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path)
+    except configparser.Error as e:
+        log("config unreadable (%s); using defaults" % e)
+        return cfg
+    if not parser.has_section("presence"):
+        return cfg
+    sec = parser["presence"]
+    values = {}
+    for name in ("enabled", "lock", "dim", "keep_screen_on", "prevent_sleep",
+                 "wake_on_return"):
+        try:
+            values[name] = sec.getboolean(name, fallback=getattr(cfg, name))
+        except ValueError:
+            log("config: %s is not a boolean; keeping default" % name)
+    for name, (lo, hi) in Config.LIMITS.items():
+        try:
+            values[name] = min(max(sec.getint(name, fallback=getattr(cfg, name)), lo), hi)
+        except ValueError:
+            log("config: %s is not a number; keeping default" % name)
+    return replace(cfg, **values)
+
+
+# ------------------------------------------------------------ decide (pure) --
+
+@dataclass(frozen=True)
+class Sensor:
+    ready: bool = False
+    present: bool = False
+    attention: bool = False
+    away_since: float = 0.0
+    looking_away_since: float = 0.0
+    mode: str = "stopped"
+
+    @classmethod
+    def from_state(cls, st):
+        if not st or not st.get("sensor_ready"):
+            return cls(mode=(st or {}).get("mode", "stopped"))
+        return cls(True, bool(st["present"]), bool(st["attention"]),
+                   float(st.get("away_since") or 0), float(st.get("looking_away_since") or 0),
+                   st.get("mode", "active"))
+
+
+@dataclass(frozen=True)
+class Memory:
+    """What the agent has already done (so each action happens once)."""
+    dimmed: bool = False
+    screen_held: bool = False               # holding the keep-screen-on inhibition
+    sleep_held: bool = False                # holding the no-sleep inhibition
+    locked_for_away: float = -1.0          # away_since of the period we locked for
+    woke_for_return: bool = False
+    sensor_mode: str = ""                   # last mode we requested
+    inhibited_until: float = 0.0
+
+
+@dataclass
+class Decision:
+    # "lock", "dim", "restore", "wake", "screen:hold|release", "sleep:hold|release",
+    # "sensor:active|standby"
+    actions: list = field(default_factory=list)
+    memory: Memory = Memory()
+    wake_at: float = None                          # next time decide() must run, or None
+
+
+def decide(now, sensor, locked, cfg, mem, inhibited=False):
+    """Pure policy: given the situation, return actions and the next deadline."""
+    d = Decision(memory=mem)
+    act = d.actions
+
+    def set_mem(**kw):
+        d.memory = replace(d.memory, **kw)
+
+    def deadline(t):
+        if t > now and (d.wake_at is None or t < d.wake_at):
+            d.wake_at = t
+
+    def hold(screen, sleep):
+        """Hold or release the keep-screen-on and no-sleep inhibitions."""
+        if d.memory.screen_held != screen:
+            act.append("screen:" + ("hold" if screen else "release")); set_mem(screen_held=screen)
+        if d.memory.sleep_held != sleep:
+            act.append("sleep:" + ("hold" if sleep else "release")); set_mem(sleep_held=sleep)
+
+    if not cfg.enabled:
+        hold(False, False)
+        if mem.dimmed:
+            act.append("restore"); set_mem(dimmed=False)
+        if mem.sensor_mode != "standby":
+            act.append("sensor:standby"); set_mem(sensor_mode="standby")
+        return d
+
+    # Sensor mode: off while locked unless it is needed to wake on return.
+    want = "standby" if (locked and not cfg.wake_on_return) else "active"
+    if mem.sensor_mode != want:
+        act.append("sensor:" + want); set_mem(sensor_mode=want)
+
+    if locked:
+        hold(False, False)
+        if mem.dimmed:                          # never leave the lock screen dimmed by us
+            act.append("restore"); set_mem(dimmed=False)
+        if cfg.wake_on_return and sensor.ready:
+            if sensor.present and not mem.woke_for_return:
+                act.append("wake"); set_mem(woke_for_return=True)
+            elif not sensor.present:
+                set_mem(woke_for_return=False)
+        return d
+
+    set_mem(woke_for_return=False)
+    if not sensor.ready:
+        hold(False, False)   # never suppress idle locking or sleep on a sensor we cannot read
+        if mem.dimmed:
+            act.append("restore"); set_mem(dimmed=False)
+        return d
+
+    blocked = inhibited or now < mem.inhibited_until
+
+    # While you look at the screen (and for a grace period after you look
+    # away), hold Plasma inhibitions so a screen that is being read is not
+    # dimmed, blanked, idle-locked or put to sleep. Leaving releases them.
+    looking = False
+    if sensor.present and (cfg.keep_screen_on or cfg.prevent_sleep):
+        until = sensor.looking_away_since + LOOK_GRACE
+        looking = sensor.attention or now < until
+        if not sensor.attention:
+            deadline(until)
+    hold(looking and cfg.keep_screen_on, looking and cfg.prevent_sleep)
+
+    # Adaptive dimming: dim after looking away while present; restore exactly
+    # when attention returns. Walking away keeps it dimmed (cheaper) until the
+    # return or the lock, which restores it.
+    if mem.dimmed and sensor.attention:
+        act.append("restore"); set_mem(dimmed=False)
+    elif cfg.dim and sensor.present and not sensor.attention and not mem.dimmed:
+        due = sensor.looking_away_since + cfg.dim_after
+        if now >= due:
+            if blocked:
+                set_mem(inhibited_until=now + INHIBIT_RETRY); deadline(now + INHIBIT_RETRY)
+            else:
+                act.append("dim"); set_mem(dimmed=True)
+        else:
+            deadline(due)
+
+    # Adaptive lock: away for lock_after seconds (once per away period).
+    if cfg.lock and not sensor.present and mem.locked_for_away != sensor.away_since:
+        due = sensor.away_since + cfg.lock_after
+        if now >= due:
+            if blocked:
+                set_mem(inhibited_until=now + INHIBIT_RETRY); deadline(now + INHIBIT_RETRY)
+            else:
+                act.append("lock"); set_mem(locked_for_away=sensor.away_since)
+        else:
+            deadline(due)
+    return d
+
+
+# -------------------------------------------------------------- side effects --
+
+class Session:
+    """Everything that touches the desktop session (over one session-bus connection).
+
+    The connection is long-lived on purpose: a screen-saver inhibition lasts
+    only as long as the connection that took it.
+    """
+
+    SCREENSAVER = ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver")
+    # Inhibitions: the screen-saver one blocks dim, blank, idle lock and sleep;
+    # the power-management one blocks sleep only.
+    INHIBITORS = {
+        "screen": (SCREENSAVER, "You are looking at the screen"),
+        "sleep": (("org.freedesktop.PowerManagement.Inhibit", "/org/freedesktop/PowerManagement/Inhibit",
+                   "org.freedesktop.PowerManagement.Inhibit"), "You are looking at the screen"),
+    }
+    BRIGHTNESS = ("org.kde.ScreenBrightness", "/org/kde/ScreenBrightness/display0",
+                  "org.kde.ScreenBrightness.Display")
+    POLICY = ("org.kde.Solid.PowerManagement", "/org/kde/Solid/PowerManagement/PolicyAgent",
+              "org.kde.Solid.PowerManagement.PolicyAgent")
+    TIMEOUT = 5  # seconds per D-Bus call
+
+    def __init__(self, log):
+        self.log = log
+        self.bus = dbus.SessionBus()
+        self.saved_brightness = None
+        self.dim_value = None
+        self.cookies = {}   # "screen"/"sleep" -> inhibition cookie
+
+    def _call(self, target, method, *args):
+        service, path, iface = target
+        obj = self.bus.get_object(service, path, introspect=False)
+        return getattr(dbus.Interface(obj, iface), method)(*args, timeout=self.TIMEOUT)
+
+    def _prop(self, target, name):
+        service, path, iface = target
+        return self._call((service, path, "org.freedesktop.DBus.Properties"), "Get", iface, name)
+
+    def _set_brightness(self, value):
+        self._call(self.BRIGHTNESS, "SetBrightness", dbus.Int32(value),
+                   dbus.UInt32(1))   # flag 1: no on-screen indicator
+
+    def locked(self):
+        try:
+            return bool(self._call(self.SCREENSAVER, "GetActive"))
+        except dbus.DBusException as e:
+            self.log("lock state unknown: %s" % e)
+            return False
+
+    def inhibited(self):
+        """True while something else (video, presentation) inhibits idle actions.
+
+        Our own inhibitions are excluded, or they would block our dim.
+        """
+        try:
+            active = self._prop(self.POLICY, "ActiveInhibitions")
+        except dbus.DBusException:
+            return False
+        return any(str(entry[1]) != APP_NAME for entry in active)
+
+    def apply(self, action, cfg):
+        try:
+            if action == "lock":
+                self._call(self.SCREENSAVER, "Lock")
+            elif action == "dim":
+                current = int(self._prop(self.BRIGHTNESS, "Brightness"))
+                target = int(self._prop(self.BRIGHTNESS, "MaxBrightness")) * cfg.dim_level // 100
+                if current > target:
+                    self.saved_brightness, self.dim_value = current, target
+                    self._set_brightness(target)
+                else:
+                    self.saved_brightness = None    # already at or below the dim level
+            elif action == "restore":
+                if self.saved_brightness is not None:
+                    # Only undo our own dim; respect a brightness the user set meanwhile.
+                    if int(self._prop(self.BRIGHTNESS, "Brightness")) == self.dim_value:
+                        self._set_brightness(self.saved_brightness)
+                    self.saved_brightness = self.dim_value = None
+            elif action.split(":")[0] in self.INHIBITORS:
+                kind, verb = action.split(":")
+                target, reason = self.INHIBITORS[kind]
+                if verb == "hold" and kind not in self.cookies:
+                    self.cookies[kind] = int(self._call(target, "Inhibit", APP_NAME, reason))
+                elif verb == "release" and kind in self.cookies:
+                    self._call(target, "UnInhibit", dbus.UInt32(self.cookies.pop(kind)))
+            elif action == "wake":
+                subprocess.run(["kscreen-doctor", "--dpms", "on"], capture_output=True, timeout=5)
+            elif action.startswith("sensor:"):
+                set_sensor_mode(action.split(":")[1])
+            self.log("action: " + action)
+        except (dbus.DBusException, subprocess.SubprocessError, OSError, ValueError) as e:
+            self.log("action %s failed: %s" % (action, e))
+
+
+# ------------------------------------------------------------------ plumbing --
+
+class Inotify:
+    def __init__(self):
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        self.libc = libc
+        self.fd = libc.inotify_init1(0x800)  # IN_NONBLOCK
+        self.watches = {}
+
+    def watch(self, directory, mask=0x08 | 0x80):  # IN_CLOSE_WRITE | IN_MOVED_TO
+        """Watch a directory; return the watch descriptor, or None on failure."""
+        wd = self.libc.inotify_add_watch(self.fd, directory.encode(), mask)
+        if wd < 0:
+            return None
+        self.watches[wd] = directory
+        return wd
+
+    def unwatch(self, wd):
+        self.libc.inotify_rm_watch(self.fd, wd)
+        self.watches.pop(wd, None)
+
+    def drain(self):
+        changed = set()
+        while True:
+            try:
+                buf = os.read(self.fd, 4096)
+            except BlockingIOError:
+                return changed
+            i = 0
+            while i + 16 <= len(buf):
+                wd, _, _, length = struct.unpack_from("iIII", buf, i)
+                name = buf[i + 16:i + 16 + length].rstrip(b"\0").decode()
+                changed.add(os.path.join(self.watches.get(wd, ""), name))
+                i += 16 + length
+
+
+def read_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def set_sensor_mode(mode):
+    """Ask the sensor service for "active" or "standby" via its control file."""
+    tmp = "%s.%d.tmp" % (MODE_FILE, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    with os.fdopen(fd, "w") as f:
+        f.write(mode + "\n")
+    os.replace(tmp, MODE_FILE)
+
+
+class RunDirWatch:
+    """Keep an inotify watch on the service's runtime directory.
+
+    The directory appears when the service first starts, which can be after
+    the agent starts (e.g. the service is switched on later). While it is
+    missing, watch /run for its creation instead.
+    """
+    IN_CREATE = 0x100
+
+    def __init__(self, notify, log):
+        self.notify, self.log = notify, log
+        self.wd = self.parent_wd = None
+        self.warned = False
+
+    def refresh(self):
+        """Call before each wait. Returns a poll timeout if watching is impossible."""
+        if self.wd is not None and not os.path.isdir(RUN_DIR):
+            self.notify.unwatch(self.wd)
+            self.wd = None
+        if self.wd is None and os.path.isdir(RUN_DIR):
+            self.wd = self.notify.watch(RUN_DIR)
+            if self.wd is None:
+                if not self.warned:
+                    self.log("cannot read %s: is this user in the asus-presence group? "
+                             "(log out and back in after installing)" % RUN_DIR)
+                    self.warned = True
+                return 60.0
+            if self.parent_wd is not None:
+                self.notify.unwatch(self.parent_wd)
+                self.parent_wd = None
+        if self.wd is None and self.parent_wd is None:
+            self.parent_wd = self.notify.watch("/run", self.IN_CREATE)
+        return None
+
+
+def write_agent_state(data):
+    os.makedirs(os.path.dirname(AGENT_FILE), exist_ok=True)
+    tmp = AGENT_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, AGENT_FILE)
+
+
+def main():
+    log = lambda m: print(m, flush=True)
+    if dbus is None:
+        log("python3-dbus is required (apt install python3-dbus)")
+        return 1
+    stop_r, stop_w = os.pipe()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: os.write(stop_w, b"x"))
+
+    session = Session(log)
+    cfg = load_config(log=log)
+    notify = Inotify()
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    notify.watch(os.path.dirname(CONFIG_FILE))
+    run_dir = RunDirWatch(notify, log)
+
+    # Lock/unlock signals from the screen locker (session bus).
+    monitor = subprocess.Popen(
+        ["gdbus", "monitor", "--session", "--dest", "org.freedesktop.ScreenSaver",
+         "--object-path", "/ScreenSaver"],
+        stdout=subprocess.PIPE)
+    mon_fd = monitor.stdout.fileno()
+    os.set_blocking(mon_fd, False)
+    mon_buf = b""
+
+    locked = session.locked()
+    mem = Memory()
+    published = None
+    log("started (locked=%s, config=%s)" % (locked, cfg))
+    try:
+        while True:
+            sensor = Sensor.from_state(read_state())
+            now = time.time()
+            # Ask D-Bus about inhibitors (video, presentation) only when an action is due.
+            inhibited = (cfg.enabled and not locked and sensor.ready and _due(now, sensor, cfg, mem)
+                         and session.inhibited())
+            d = decide(now, sensor, locked, cfg, mem, inhibited)
+            for action in d.actions:
+                session.apply(action, cfg)
+            mem = d.memory
+
+            agent = {"locked": locked, "dimmed": mem.dimmed,
+                     "screen_held": mem.screen_held, "sleep_held": mem.sleep_held,
+                     "sensor_mode": mem.sensor_mode,
+                     "config": cfg.__dict__, "inhibited": inhibited,
+                     "next_check": d.wake_at}
+            if d.actions:
+                agent.update(last_action=", ".join(d.actions), last_action_at=now)
+            elif published:
+                agent.update({k: published[k] for k in ("last_action", "last_action_at") if k in published})
+            if agent != published:
+                write_agent_state(agent)
+                published = agent
+
+            timeout = None if d.wake_at is None else max(0.0, d.wake_at - time.time())
+            poll = run_dir.refresh()
+            if poll is not None:
+                timeout = poll if timeout is None else min(timeout, poll)
+            r, _, _ = select.select([notify.fd, mon_fd, stop_r], [], [], timeout)
+            if stop_r in r:
+                break
+            if mon_fd in r:
+                chunk = os.read(mon_fd, 4096)
+                if not chunk:
+                    log("screen-saver monitor exited")
+                    return 1   # systemd restarts us
+                mon_buf += chunk
+                *lines, mon_buf = mon_buf.split(b"\n")
+                for line in lines:
+                    text = line.decode(errors="replace")
+                    if "ScreenSaver.ActiveChanged" in text:
+                        locked = "true" in text.split("ActiveChanged", 1)[1]
+                        log("session %s" % ("locked" if locked else "unlocked"))
+            if notify.fd in r and CONFIG_FILE in notify.drain():
+                cfg = load_config(log=log)
+                log("config reloaded: %s" % (cfg,))
+    finally:
+        if mem.dimmed:
+            session.apply("restore", cfg)
+        for kind, held in (("screen", mem.screen_held), ("sleep", mem.sleep_held)):
+            if held:
+                session.apply(kind + ":release", cfg)
+        monitor.terminate()
+    return 0
+
+
+def _due(now, sensor, cfg, mem):
+    """Only ask D-Bus about inhibitors when an action is actually due."""
+    if cfg.dim and sensor.present and not sensor.attention and not mem.dimmed:
+        if now >= sensor.looking_away_since + cfg.dim_after:
+            return True
+    if cfg.lock and not sensor.present and mem.locked_for_away != sensor.away_since:
+        if now >= sensor.away_since + cfg.lock_after:
+            return True
+    return False
+
+
+if __name__ == "__main__":
+    sys.exit(main())

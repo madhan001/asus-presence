@@ -1,0 +1,15 @@
+[Unit]
+Description=Presence agent: adaptive lock and dimming from the webcam presence sensor
+Documentation=https://github.com/madhan001/asus-presence
+PartOf=graphical-session.target
+After=plasma-workspace.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/asus-presence-agent
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

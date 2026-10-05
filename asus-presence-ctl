@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""asus-presence-ctl: read state / change settings for the presence agent.
+
+  asus-presence-ctl get              one JSON document for the test UI
+  asus-presence-ctl set KEY VALUE    validated update of ~/.config/asus-presence/presence.conf
+
+The agent watches the config file, so a `set` applies immediately.
+"""
+
+import configparser
+import json
+import os
+import subprocess
+import sys
+
+CONFIG_FILE = os.path.expanduser("~/.config/asus-presence/presence.conf")
+STATE_FILE = "/run/asus-presence/state.json"
+AGENT_FILE = os.path.expanduser("~/.cache/asus-presence/agent.json")
+
+BOOLS = {"enabled", "lock", "dim", "keep_screen_on", "prevent_sleep", "wake_on_return"}
+INTS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90)}
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def unit_state(args):
+    r = subprocess.run(["systemctl", *args], capture_output=True, text=True)
+    return r.stdout.strip() or "unknown"
+
+
+def get():
+    print(json.dumps({
+        "sensor": read_json(STATE_FILE),
+        "agent": read_json(AGENT_FILE),
+        "service": unit_state(["is-active", "asus-presence.service"]),
+        "service_enabled": unit_state(["is-enabled", "asus-presence.service"]),
+        "agent_service": unit_state(["--user", "is-active", "asus-presence-agent.service"]),
+    }))
+
+
+def set_value(key, value):
+    if key in BOOLS:
+        if value not in ("true", "false"):
+            sys.exit("%s must be true or false" % key)
+    elif key in INTS:
+        lo, hi = INTS[key]
+        if not value.isdigit() or not lo <= int(value) <= hi:
+            sys.exit("%s must be an integer in %d..%d" % (key, lo, hi))
+    else:
+        sys.exit("unknown setting: %s" % key)
+    parser = configparser.ConfigParser()
+    parser.read(CONFIG_FILE)
+    if not parser.has_section("presence"):
+        parser.add_section("presence")
+    parser["presence"][key] = value
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        parser.write(f)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def main(argv):
+    if len(argv) == 2 and argv[1] == "get":
+        get()
+    elif len(argv) == 4 and argv[1] == "set":
+        set_value(argv[2], argv[3])
+    else:
+        sys.exit("usage: asus-presence-ctl get | set KEY VALUE")
+
+
+if __name__ == "__main__":
+    main(sys.argv)
