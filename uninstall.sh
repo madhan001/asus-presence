@@ -15,6 +15,7 @@ purge=0
 [[ ${EUID} -ne 0 ]] || { echo "run this as your desktop user, not root" >&2; exit 1; }
 
 echo "==> Stopping"
+command -v asus-presence-ctl >/dev/null && asus-presence-ctl tray off >/dev/null 2>&1 || true
 systemctl --user disable --now asus-presence-agent.service 2>/dev/null || true
 sudo systemctl disable --now asus-presence.service 2>/dev/null || true
 

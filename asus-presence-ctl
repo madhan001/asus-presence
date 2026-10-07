@@ -3,18 +3,29 @@
 
   asus-presence-ctl get              one JSON document for the test UI
   asus-presence-ctl set KEY VALUE    validated update of ~/.config/asus-presence/presence.conf
+  asus-presence-ctl status           one word: looking, present, away, starting, standby or off
+  asus-presence-ctl wait STATUS      block until the status differs from STATUS (at most
+                                     WAIT_MAX seconds), then print it; the tray icon's long poll
+  asus-presence-ctl tray on|off|get  show the Presence Sensor in Plasma's system tray
 
 The agent watches the config file, so a `set` applies immediately.
 """
 
 import configparser
+import ctypes
+import ctypes.util
 import json
 import os
+import select
 import subprocess
 import sys
+import time
 
 CONFIG_FILE = os.path.expanduser("~/.config/asus-presence/presence.conf")
-STATE_FILE = "/run/asus-presence/state.json"
+RUN_DIR = "/run/asus-presence"
+STATE_FILE = RUN_DIR + "/state.json"
+WAIT_MAX = 600   # seconds; the caller simply waits again
+PLASMOID = "asus-presence"
 AGENT_FILE = os.path.expanduser("~/.cache/asus-presence/agent.json")
 
 BOOLS = {"enabled", "lock", "dim", "keep_screen_on", "prevent_sleep", "wake_on_return", "screen_off"}
@@ -77,13 +88,98 @@ def set_value(key, value):
     os.replace(tmp, CONFIG_FILE)
 
 
+def status(state):
+    """The sensor state as one word (what the tray icon shows)."""
+    if not state or state.get("mode") not in ("active", "standby") or not state.get("sensor"):
+        return "off"
+    if state["mode"] == "standby":
+        return "standby"
+    if not state.get("sensor_ready"):
+        return "starting"
+    if not state.get("present"):
+        return "away"
+    return "looking" if state.get("attention") else "present"
+
+
+def wait(current):
+    """Print the status once it differs from `current`.
+
+    Blocks on inotify (state.json is replaced on every change), so a waiting
+    tray icon costs nothing between changes. Distance-only changes wake it but
+    do not end the wait.
+    """
+    deadline = time.monotonic() + WAIT_MAX
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    fd = libc.inotify_init1(0o4000)   # IN_NONBLOCK
+    watched = False
+    try:
+        while True:
+            if not watched:
+                # IN_CLOSE_WRITE | IN_MOVED_TO; fails while the service has never run
+                watched = libc.inotify_add_watch(fd, RUN_DIR.encode(), 0x08 | 0x80) >= 0
+            now = status(read_json(STATE_FILE))
+            left = deadline - time.monotonic()
+            if now != current or left <= 0:
+                print(now)
+                return
+            select.select([fd], [], [], min(left, 60.0) if not watched else left)
+            try:
+                os.read(fd, 4096)
+            except BlockingIOError:
+                pass
+    finally:
+        os.close(fd)
+
+
+# Plasma scripting: the tray keeps its plasmoids in its own "extraItems" list.
+TRAY_SCRIPT = """
+var id = "%s", action = "%s", found = false, trays = 0;
+panels().forEach(function (panel) {
+  panel.widgets("org.kde.plasma.systemtray").forEach(function (tray) {
+    trays++;
+    tray.currentConfigGroup = ["General"];
+    var items = tray.readConfig("extraItems", []);
+    items = (typeof items === "string" ? items.split(",") : Array.prototype.slice.call(items))
+            .filter(function (x) { return x.length > 0; });
+    var i = items.indexOf(id);
+    if (i >= 0) found = true;
+    if (action === "on" && i < 0) { items.push(id); tray.writeConfig("extraItems", items); tray.reloadConfig(); }
+    if (action === "off" && i >= 0) { items.splice(i, 1); tray.writeConfig("extraItems", items); tray.reloadConfig(); }
+  });
+});
+print(trays === 0 ? "no-tray" : (action === "get" ? (found ? "on" : "off") : action));
+"""
+
+
+def tray(action):
+    r = subprocess.run(
+        ["gdbus", "call", "--session", "--dest", "org.kde.plasmashell", "--object-path", "/PlasmaShell",
+         "--method", "org.kde.PlasmaShell.evaluateScript", TRAY_SCRIPT % (PLASMOID, action)],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("cannot reach Plasma: %s" % r.stderr.strip())
+    for word in ("no-tray", "on", "off"):
+        if "'%s" % word in r.stdout:
+            if word == "no-tray":
+                sys.exit("no system tray found in any panel")
+            print(word)
+            return
+    sys.exit("unexpected reply from Plasma: %s" % r.stdout.strip())
+
+
 def main(argv):
     if len(argv) == 2 and argv[1] == "get":
         get()
     elif len(argv) == 4 and argv[1] == "set":
         set_value(argv[2], argv[3])
+    elif len(argv) == 2 and argv[1] == "status":
+        print(status(read_json(STATE_FILE)))
+    elif len(argv) == 3 and argv[1] == "wait":
+        wait(argv[2])
+    elif len(argv) == 3 and argv[1] == "tray" and argv[2] in ("on", "off", "get"):
+        tray(argv[2])
     else:
-        sys.exit("usage: asus-presence-ctl get | set KEY VALUE")
+        sys.exit("usage: asus-presence-ctl get | set KEY VALUE | status | wait STATUS | tray on|off|get")
 
 
 if __name__ == "__main__":

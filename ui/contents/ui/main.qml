@@ -9,8 +9,10 @@ import org.kde.plasma.extras as PlasmaExtras
 import org.kde.plasma.plasma5support as Plasma5Support
 import org.kde.plasma.plasmoid
 
-// Live view and settings for the webcam presence sensor. Meant to be opened in
-// its own window (plasmawindowed asus-presence); it only polls while shown.
+// Live view and settings for the webcam presence sensor. Opened in its own
+// window (plasmawindowed asus-presence), or shown as a pair of eyes in the
+// system tray. The full view only polls while shown; the tray icon long-polls
+// (`asus-presence-ctl wait`), which blocks until the status changes.
 PlasmoidItem {
     id: root
 
@@ -21,6 +23,8 @@ PlasmoidItem {
     property var history: []        // [{t, distance, present, attention}]
     property bool busy: false
     property string lastError: ""
+    property string trayStatus: "off"   // looking, present, away, starting, standby, off
+    property string trayEnabled: ""     // "on"/"off" once known; whether the tray shows us
 
     readonly property var sensor: st.sensor || {}
     readonly property var agent: st.agent || {}
@@ -28,11 +32,106 @@ PlasmoidItem {
     readonly property bool serviceOn: st.service === "active"
     readonly property bool ready: serviceOn && sensor.sensor_ready === true
 
-    preferredRepresentation: fullRepresentation
-    Plasmoid.icon: sensor.present ? "user-available-symbolic" : "user-away-symbolic"
+    readonly property bool inWindow: Plasmoid.formFactor === PlasmaCore.Types.Planar
+    readonly property var statusTexts: ({
+        looking: "Looking at the screen", present: "Present, looking away", away: "Away",
+        starting: "Starting sensor…", standby: "Sensor in standby", off: "Sensor off"
+    })
+
+    preferredRepresentation: inWindow ? fullRepresentation : compactRepresentation
+    Plasmoid.icon: "view-visible-symbolic"
+    Plasmoid.status: PlasmaCore.Types.ActiveStatus   // always visible once added to the tray
+    toolTipMainText: "Presence Sensor"
+    toolTipSubText: statusTexts[trayStatus] || ""
+
+    // Tray icon: wait for the next status change, then wait again.
+    function watch() {
+        if (!inWindow) {
+            watcher.connectSource(ctl + " wait " + trayStatus);
+        }
+    }
+    Component.onCompleted: watch()
+    onInWindowChanged: watch()
+
+    Plasma5Support.DataSource {
+        id: watcher
+        engine: "executable"
+        interval: 0
+        onNewData: function(source, data) {
+            disconnectSource(source);
+            const word = (data["stdout"] || "").toString().trim();
+            if (word.length > 0 && !data["exit code"]) {
+                root.trayStatus = word;
+                root.watch();
+            } else {
+                retry.start();   // e.g. not installed yet: try again later
+            }
+        }
+    }
+    Timer {
+        id: retry
+        interval: 30000
+        onTriggered: root.watch()
+    }
+
+    compactRepresentation: MouseArea {
+        id: compact
+        hoverEnabled: true
+        onClicked: root.expanded = !root.expanded
+
+        // Two eyes: open and looking at you, glancing aside, or closed (away);
+        // faded while the sensor is not reporting.
+        readonly property bool open: root.trayStatus === "looking" || root.trayStatus === "present"
+                                     || root.trayStatus === "starting"
+        readonly property real glance: root.trayStatus === "present" ? 1 : 0
+        readonly property real s: Math.min(width, height) * 0.9
+        opacity: root.trayStatus === "looking" || root.trayStatus === "present" || root.trayStatus === "away" ? 1 : 0.45
+
+        Row {
+            anchors.centerIn: parent
+            spacing: compact.s * 0.1
+            Repeater {
+                model: 2
+                Item {
+                    width: compact.s * 0.4
+                    height: compact.s * 0.62
+                    Rectangle {   // eye
+                        anchors.fill: parent
+                        visible: compact.open
+                        radius: width / 2
+                        color: "transparent"
+                        border.width: Math.max(1, compact.s * 0.07)
+                        border.color: Kirigami.Theme.textColor
+                        Rectangle {   // pupil; glancing aside keeps it inside the outline
+                            width: parent.width * 0.4
+                            height: width
+                            radius: width / 2
+                            color: Kirigami.Theme.textColor
+                            y: parent.height * 0.5 - height * 0.35
+                            x: (parent.width - width) / 2
+                               + compact.glance * ((parent.width - width) / 2 - parent.border.width * 1.5)
+                            Behavior on x { NumberAnimation { duration: Kirigami.Units.shortDuration } }
+                        }
+                    }
+                    Rectangle {   // closed lid
+                        visible: !compact.open
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width
+                        height: Math.max(1, compact.s * 0.07)
+                        radius: height / 2
+                        color: Kirigami.Theme.textColor
+                    }
+                }
+            }
+        }
+    }
 
     function refresh() {
         runner.connectSource(ctl + " get");
+    }
+
+    function refreshTray() {
+        runner.connectSource(ctl + " tray get");
     }
 
     function run(command) {
@@ -85,7 +184,9 @@ PlasmoidItem {
         onNewData: function(source, data) {
             runner.disconnectSource(source);
             const out = (data["stdout"] || "").toString();
-            if (source === root.ctl + " get") {
+            if (source === root.ctl + " tray get") {
+                root.trayEnabled = data["exit code"] ? "" : out.trim();
+            } else if (source === root.ctl + " get") {
                 try {
                     root.st = JSON.parse(out);
                     const s = root.st.sensor || {};
@@ -102,6 +203,9 @@ PlasmoidItem {
                 root.busy = false;
                 root.lastError = data["exit code"] ? (data["stderr"] || "").toString().trim() : "";
                 root.refresh();
+                if (source.indexOf(root.ctl + " tray ") === 0) {
+                    root.refreshTray();
+                }
             }
         }
     }
@@ -149,6 +253,7 @@ PlasmoidItem {
             running: content.visible && content.Window.window !== null && content.Window.window.visible
             triggeredOnStart: true
             onTriggered: root.refresh()
+            onRunningChanged: if (running) root.refreshTray()
         }
 
         ColumnLayout {
@@ -340,6 +445,14 @@ PlasmoidItem {
                         font: Kirigami.Theme.smallFont
                         opacity: 0.7
                         elide: Text.ElideRight
+                    }
+                    PlasmaComponents3.CheckBox {
+                        Layout.topMargin: Kirigami.Units.smallSpacing
+                        text: "Show the status in the system tray"
+                        visible: root.trayEnabled !== ""
+                        enabled: !root.busy
+                        checked: root.trayEnabled === "on"
+                        onToggled: root.run(root.ctl + " tray " + (checked ? "on" : "off"))
                     }
                 }
             }

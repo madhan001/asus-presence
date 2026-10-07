@@ -44,6 +44,14 @@ Then log out and back in once: the installer adds you to the `asus-presence`
 group, which may read the sensor state. Open **Presence Sensor** from the
 launcher to watch it live and change settings.
 
+**Tray icon (optional):** tick "Show the status in the system tray" in that
+window (or run `asus-presence-ctl tray on`) for a pair of eyes in the tray:
+open while you look at the screen, glancing aside when you look away, closed
+when you are away, and faded while the sensor is off or in standby. Click it
+for the full view. The first time, Plasma may only show it after you log in
+again. It waits for changes instead of polling, so it costs nothing while
+nothing changes.
+
 Remove with `./uninstall.sh` (add `--purge` to delete your settings too).
 
 ## How it works
@@ -83,6 +91,7 @@ nothing while locked.
 ```sh
 asus-presence-ctl set lock_after 120
 asus-presence-ctl get        # sensor + agent state as JSON
+asus-presence-ctl status     # looking, present, away, starting, standby or off
 ```
 
 | Key | Default | Meaning |
