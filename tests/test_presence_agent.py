@@ -180,6 +180,13 @@ class ConfigTests(unittest.TestCase):
         c = self.load("[presence]\nlock = maybe\nlock_after = soon\n")
         self.assertEqual((c.lock, c.lock_after), (Config().lock, Config().lock_after))
 
+    def test_sample_rate(self):
+        self.assertEqual(self.load("[presence]\nsample_rate = 5\n").sample_rate, 5.0)
+        self.assertEqual(self.load("[presence]\nsample_rate = 50\n").sample_rate, 10.0)
+        self.assertEqual(self.load("[presence]\nsample_rate = 0.1\n").sample_rate, 0.5)
+        self.assertEqual(self.load("[presence]\nsample_rate = nan\n").sample_rate, Config().sample_rate)
+        self.assertEqual(self.load("[presence]\nsample_rate = quick\n").sample_rate, Config().sample_rate)
+
 
 if __name__ == "__main__":
     unittest.main()

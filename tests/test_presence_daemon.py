@@ -128,5 +128,36 @@ class ControlFileTests(unittest.TestCase):
         self.assertEqual(daemon.wanted_mode(), "active")
 
 
+class RateFileTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.rate_file = os.path.join(self.dir.name, "rate")
+        self.saved = daemon.RATE_FILE
+        daemon.RATE_FILE = self.rate_file
+        self.addCleanup(setattr, daemon, "RATE_FILE", self.saved)
+
+    def put(self, text):
+        with open(self.rate_file, "w") as f:
+            f.write(text)
+        return daemon.wanted_rate()
+
+    def test_missing_means_default(self):
+        self.assertEqual(daemon.wanted_rate(), daemon.SAMPLE_HZ)
+
+    def test_value(self):
+        self.assertEqual(self.put("5\n"), 5.0)
+        self.assertEqual(self.put("0.5"), 0.5)
+
+    def test_clamped(self):
+        self.assertEqual(self.put("1000"), daemon.RATE_MAX)
+        self.assertEqual(self.put("0"), daemon.RATE_MIN)
+        self.assertEqual(self.put("inf"), daemon.RATE_MAX)
+
+    def test_garbage_means_default(self):
+        self.assertEqual(self.put("fast"), daemon.SAMPLE_HZ)
+        self.assertEqual(self.put("nan"), daemon.SAMPLE_HZ)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,7 @@ AGENT_FILE = os.path.expanduser("~/.cache/asus-presence/agent.json")
 
 BOOLS = {"enabled", "lock", "dim", "keep_screen_on", "prevent_sleep", "wake_on_return"}
 INTS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90)}
+FLOATS = {"sample_rate": (0.5, 10.0)}
 
 
 def read_json(path):
@@ -52,6 +53,15 @@ def set_value(key, value):
         lo, hi = INTS[key]
         if not value.isdigit() or not lo <= int(value) <= hi:
             sys.exit("%s must be an integer in %d..%d" % (key, lo, hi))
+    elif key in FLOATS:
+        lo, hi = FLOATS[key]
+        try:
+            number = float(value)
+        except ValueError:
+            number = None
+        if number is None or not lo <= number <= hi:
+            sys.exit("%s must be a number in %g..%g" % (key, lo, hi))
+        value = "%g" % number
     else:
         sys.exit("unknown setting: %s" % key)
     parser = configparser.ConfigParser()

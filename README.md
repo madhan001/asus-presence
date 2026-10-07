@@ -54,11 +54,12 @@ webcam presence engine --USB HID--> hid_sensor_prox (iio)
         ~/.config/asus-presence/presence.conf
 ```
 
-- `asus-presence-sensord` streams the sensor through the iio buffer at 2 Hz. The
+- `asus-presence-sensord` streams the sensor through the iio buffer, at 2 Hz by
+  default (`sample_rate`, changed live without restarting the stream). The
   sensor only reports while streamed; a one-shot sysfs read powers it off again
   before it has a result. Some webcams expose two presence sensors of which only
   one reports, so each candidate is probed for up to 15 s and the working one kept.
-  Presence and attention must hold for two samples (1 s) before they change.
+  Presence and attention must hold for two samples (1 s at 2 Hz) before they change.
 - `asus-presence-agent` locks through `org.freedesktop.ScreenSaver`, dims through
   Plasma's `org.kde.ScreenBrightness`, and keeps the screen on with screen-saver
   and power-management inhibitions (shown as "ASUS Presence" in the battery
@@ -68,8 +69,8 @@ webcam presence engine --USB HID--> hid_sensor_prox (iio)
 Both are event-driven: no polling, and the state file is rewritten only when
 something changes.
 
-**Power:** about 0.3 W or less while streaming (measured on the PX13), nothing
-while locked.
+**Power:** about 0.3 W or less while streaming at 2 Hz (measured on the PX13),
+nothing while locked.
 
 ## Settings
 
@@ -89,6 +90,7 @@ asus-presence-ctl get        # sensor + agent state as JSON
 | `keep_screen_on` | `true` | No idle dim, blank, lock or sleep while you look at the screen |
 | `prevent_sleep` | `true` | No idle sleep while you look at the screen |
 | `wake_on_return` | `false` | Keep the sensor on while locked and wake the screen when you return |
+| `sample_rate` | `2` | Sensor reports per second (0.5 to 10). Reacts in about 2/rate seconds; higher uses more power |
 
 ## Troubleshooting
 

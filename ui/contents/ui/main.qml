@@ -287,6 +287,63 @@ PlasmoidItem {
                 }
             }
 
+            // Sample rate --------------------------------------------------
+            // Applied live by the sensor service (through the agent). Presence and
+            // attention must hold for two samples, so the rate sets how fast it reacts.
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Kirigami.Units.gridUnit
+
+                Kirigami.Icon {
+                    Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+                    Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+                    source: "speedometer"
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.smallSpacing / 2
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        PlasmaComponents3.Label {
+                            Layout.fillWidth: true
+                            text: "Sensor updates"
+                        }
+                        PlasmaComponents3.ComboBox {
+                            id: rateBox
+                            enabled: !root.busy
+                            textRole: "text"
+                            valueRole: "value"
+                            model: [
+                                { text: "Every 2 s (0.5 Hz)", value: 0.5 },
+                                { text: "Every second (1 Hz)", value: 1 },
+                                { text: "2 per second (2 Hz)", value: 2 },
+                                { text: "5 per second (5 Hz)", value: 5 },
+                                { text: "10 per second (10 Hz)", value: 10 }
+                            ]
+                            readonly property real configured: root.cfg.sample_rate || 2
+                            // Not indexOfValue(): it runs before the model is loaded and is not re-evaluated.
+                            currentIndex: Math.max(0, model.findIndex(r => r.value === configured))
+                            onActivated: root.setting("sample_rate", currentValue)
+                        }
+                    }
+                    PlasmaComponents3.Label {
+                        Layout.fillWidth: true
+                        readonly property real rate: rateBox.configured
+                        readonly property bool pending: root.serviceOn && root.sensor.mode === "active"
+                                                        && root.sensor.rate_hz !== undefined
+                                                        && Math.abs(root.sensor.rate_hz - rate) > 0.01
+                        text: (pending ? "Applying… · " : "")
+                              + "Reacts in about " + (Math.round(20 / rate) / 10) + " s"
+                              + (rate > 2 ? " · uses more power" : rate < 2 ? " · saves a little power" : "")
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.7
+                        elide: Text.ElideRight
+                    }
+                }
+            }
+
             // Agent -------------------------------------------------------
             RowLayout {
                 Layout.fillWidth: true

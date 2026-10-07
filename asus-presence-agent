@@ -12,8 +12,9 @@ and, per ~/.config/asus-presence/presence.conf:
   * optionally wakes the screen when you return to a locked session.
 
 It also puts the sensor in standby while the session is locked (unless
-wake_on_return needs it), so the webcam's USB link can suspend. It does that
-by writing the service's group-writable control file: no root needed.
+wake_on_return needs it), so the webcam's USB link can suspend, and passes on
+the configured sample_rate. It does both by writing the service's
+group-writable control files: no root needed.
 
 Targets KDE Plasma 6 (org.kde.ScreenBrightness, PowerDevil's PolicyAgent).
 
@@ -45,6 +46,7 @@ except ImportError:
 RUN_DIR = "/run/asus-presence"
 STATE_FILE = RUN_DIR + "/state.json"
 MODE_FILE = RUN_DIR + "/control/mode"
+RATE_FILE = RUN_DIR + "/control/rate"
 CONFIG_FILE = os.path.expanduser("~/.config/asus-presence/presence.conf")
 AGENT_FILE = os.path.expanduser("~/.cache/asus-presence/agent.json")
 APP_NAME = "ASUS Presence"   # shown in Plasma's battery applet while an inhibition is held
@@ -65,8 +67,10 @@ class Config:
     keep_screen_on: bool = True  # no idle dim/blank/lock (nor sleep) while you look at the screen
     prevent_sleep: bool = True   # no idle sleep while you look at the screen
     wake_on_return: bool = False
+    sample_rate: float = 2.0     # sensor reports per second (Hz)
 
     LIMITS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90)}
+    FLOAT_LIMITS = {"sample_rate": (0.5, 10.0)}
 
 
 def load_config(path=CONFIG_FILE, log=print):
@@ -93,6 +97,14 @@ def load_config(path=CONFIG_FILE, log=print):
             values[name] = min(max(sec.getint(name, fallback=getattr(cfg, name)), lo), hi)
         except ValueError:
             log("config: %s is not a number; keeping default" % name)
+    for name, (lo, hi) in Config.FLOAT_LIMITS.items():
+        try:
+            value = sec.getfloat(name, fallback=getattr(cfg, name))
+        except ValueError:
+            log("config: %s is not a number; keeping default" % name)
+            continue
+        if value == value:   # not NaN
+            values[name] = min(max(value, lo), hi)
     return replace(cfg, **values)
 
 
@@ -317,7 +329,7 @@ class Session:
             elif action == "wake":
                 subprocess.run(["kscreen-doctor", "--dpms", "on"], capture_output=True, timeout=5)
             elif action.startswith("sensor:"):
-                set_sensor_mode(action.split(":")[1])
+                write_control(MODE_FILE, action.split(":")[1])
             self.log("action: " + action)
         except (dbus.DBusException, subprocess.SubprocessError, OSError, ValueError) as e:
             self.log("action %s failed: %s" % (action, e))
@@ -367,13 +379,13 @@ def read_state():
         return None
 
 
-def set_sensor_mode(mode):
-    """Ask the sensor service for "active" or "standby" via its control file."""
-    tmp = "%s.%d.tmp" % (MODE_FILE, os.getpid())
+def write_control(path, value):
+    """Pass a setting to the sensor service through one of its control files."""
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     with os.fdopen(fd, "w") as f:
-        f.write(mode + "\n")
-    os.replace(tmp, MODE_FILE)
+        f.write("%s\n" % value)
+    os.replace(tmp, path)
 
 
 class RunDirWatch:
@@ -449,6 +461,7 @@ def main():
     locked = session.locked()
     mem = Memory()
     published = None
+    rate_sent = None   # sample_rate last written to the service
     log("started (locked=%s, config=%s)" % (locked, cfg))
     try:
         while True:
@@ -461,6 +474,15 @@ def main():
             for action in d.actions:
                 session.apply(action, cfg)
             mem = d.memory
+            # Sent once the service's control directory exists (its creation wakes this loop).
+            if rate_sent != cfg.sample_rate and os.path.isdir(os.path.dirname(RATE_FILE)):
+                try:
+                    write_control(RATE_FILE, "%g" % cfg.sample_rate)
+                    rate_sent = cfg.sample_rate
+                    log("sample rate: %g Hz" % cfg.sample_rate)
+                except OSError as e:
+                    log("cannot set the sample rate: %s" % e)
+                    rate_sent = cfg.sample_rate   # retried on the next config change
 
             agent = {"locked": locked, "dimmed": mem.dimmed,
                      "screen_held": mem.screen_held, "sleep_held": mem.sleep_held,

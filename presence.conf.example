@@ -22,3 +22,7 @@ prevent_sleep = true
 # Keep the sensor on while locked and wake the screen when you return.
 # Off by default: costs a little power while the session is locked.
 wake_on_return = false
+# How often the sensor reports, in Hz (0.5..10). Presence and attention must
+# hold for two reports, so this sets how quickly it reacts (about 2/rate
+# seconds); higher rates use more power. Applied live.
+sample_rate = 2
