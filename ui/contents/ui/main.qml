@@ -374,7 +374,8 @@ PlasmoidItem {
                     }
                     PlasmaComponents3.Label {
                         Layout.fillWidth: true
-                        text: [root.agent.dimmed ? "Screen dimmed by presence" : "",
+                        text: [root.agent.screen_off ? "Screen turned off (you are away)" : "",
+                               root.agent.dimmed ? "Screen dimmed by presence" : "",
                                root.agent.screen_held ? "Keeping the screen on"
                                    : root.agent.sleep_held ? "Preventing sleep" : "",
                                root.agent.last_action ? "Last: " + root.agent.last_action + " (" + root.ago(root.agent.last_action_at) + ")" : "No actions yet",
@@ -402,6 +403,18 @@ PlasmoidItem {
                             from: 10; to: 3600; stepSize: 10
                             value: root.cfg.lock_after || 60
                             onValueModified: root.setting("lock_after", value)
+                        }
+                        PlasmaComponents3.Label { text: "seconds" }
+
+                        PlasmaComponents3.CheckBox {
+                            text: "Turn the screen off when away for"
+                            checked: root.cfg.screen_off !== false
+                            onToggled: root.setting("screen_off", checked)
+                        }
+                        PlasmaComponents3.SpinBox {
+                            from: 10; to: 3600; stepSize: 10
+                            value: root.cfg.screen_off_after || 60
+                            onValueModified: root.setting("screen_off_after", value)
                         }
                         PlasmaComponents3.Label { text: "seconds" }
 

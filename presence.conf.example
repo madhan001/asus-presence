@@ -7,6 +7,11 @@ enabled = true
 # Lock the session after being away this many seconds (10..3600).
 lock = true
 lock_after = 60
+# Turn the screen off after being away this many seconds (10..3600), and back
+# on when you return (or at any input). Saves power and OLED wear even when
+# lock is off. Paused while an app (e.g. a video) inhibits idle actions.
+screen_off = true
+screen_off_after = 60
 # Dim the built-in screen after looking away this many seconds (3..600),
 # to dim_level percent of maximum brightness (5..90); restored when you look back.
 dim = true

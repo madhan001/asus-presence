@@ -17,8 +17,9 @@ CONFIG_FILE = os.path.expanduser("~/.config/asus-presence/presence.conf")
 STATE_FILE = "/run/asus-presence/state.json"
 AGENT_FILE = os.path.expanduser("~/.cache/asus-presence/agent.json")
 
-BOOLS = {"enabled", "lock", "dim", "keep_screen_on", "prevent_sleep", "wake_on_return"}
-INTS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90)}
+BOOLS = {"enabled", "lock", "dim", "keep_screen_on", "prevent_sleep", "wake_on_return", "screen_off"}
+INTS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90),
+        "screen_off_after": (10, 3600)}
 FLOATS = {"sample_rate": (0.5, 10.0)}
 
 

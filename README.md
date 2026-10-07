@@ -4,6 +4,8 @@ Adaptive Lock and Adaptive Dimming on Linux for laptops whose webcam has a
 built-in human-presence sensor, such as the ASUS "AI camera" (USB `3277:0059`).
 
 - **Lock on leave:** locks the session after you have been away for a while (default 60 s).
+- **Screen off on leave:** turns the screen off when you have been away for a while
+  (default 60 s) and back on when you return; useful on OLED panels even with locking off.
 - **Adaptive dimming:** dims the built-in screen when you look away (default 10 s) and
   restores it when you look back.
 - **Keep the screen on while you look at it:** no idle dimming, blanking, locking or
@@ -61,7 +63,8 @@ webcam presence engine --USB HID--> hid_sensor_prox (iio)
   one reports, so each candidate is probed for up to 15 s and the working one kept.
   Presence and attention must hold for two samples (1 s at 2 Hz) before they change.
 - `asus-presence-agent` locks through `org.freedesktop.ScreenSaver`, dims through
-  Plasma's `org.kde.ScreenBrightness`, and keeps the screen on with screen-saver
+  Plasma's `org.kde.ScreenBrightness`, turns the screen off and on with
+  `kscreen-doctor --dpms`, and keeps the screen on with screen-saver
   and power-management inhibitions (shown as "ASUS Presence" in the battery
   applet). While the session is locked it puts the sensor in standby so the
   webcam's USB link can suspend.
@@ -86,6 +89,7 @@ asus-presence-ctl get        # sensor + agent state as JSON
 | --- | --- | --- |
 | `enabled` | `true` | Master switch for the agent |
 | `lock`, `lock_after` | `true`, `60` | Lock after this many seconds away (10 to 3600) |
+| `screen_off`, `screen_off_after` | `true`, `60` | Turn the screen off after this many seconds away (10 to 3600); back on when you return |
 | `dim`, `dim_after`, `dim_level` | `true`, `10`, `30` | Dim to `dim_level` % after looking away this many seconds |
 | `keep_screen_on` | `true` | No idle dim, blank, lock or sleep while you look at the screen |
 | `prevent_sleep` | `true` | No idle sleep while you look at the screen |

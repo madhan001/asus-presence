@@ -4,6 +4,8 @@
 Reads the state published by the asus-presence service (asus-presence-sensord)
 and, per ~/.config/asus-presence/presence.conf:
   * locks the session after you have been away for `lock_after` seconds,
+  * turns the screen off after you have been away for `screen_off_after`
+    seconds and back on when you return (saves power, and OLED wear),
   * dims the built-in screen after you have looked away for `dim_after`
     seconds and restores it when you look back,
   * while you are looking at the screen, keeps it on (no idle dim, blank
@@ -67,9 +69,12 @@ class Config:
     keep_screen_on: bool = True  # no idle dim/blank/lock (nor sleep) while you look at the screen
     prevent_sleep: bool = True   # no idle sleep while you look at the screen
     wake_on_return: bool = False
+    screen_off: bool = True
+    screen_off_after: int = 60   # seconds away before turning the screen off
     sample_rate: float = 2.0     # sensor reports per second (Hz)
 
-    LIMITS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90)}
+    LIMITS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90),
+              "screen_off_after": (10, 3600)}
     FLOAT_LIMITS = {"sample_rate": (0.5, 10.0)}
 
 
@@ -87,7 +92,7 @@ def load_config(path=CONFIG_FILE, log=print):
     sec = parser["presence"]
     values = {}
     for name in ("enabled", "lock", "dim", "keep_screen_on", "prevent_sleep",
-                 "wake_on_return"):
+                 "wake_on_return", "screen_off"):
         try:
             values[name] = sec.getboolean(name, fallback=getattr(cfg, name))
         except ValueError:
@@ -135,6 +140,8 @@ class Memory:
     screen_held: bool = False               # holding the keep-screen-on inhibition
     sleep_held: bool = False                # holding the no-sleep inhibition
     locked_for_away: float = -1.0          # away_since of the period we locked for
+    off_for_away: float = -1.0             # away_since of the period we turned the screen off for
+    screen_off: bool = False               # we turned the screen off and have not woken it
     woke_for_return: bool = False
     sensor_mode: str = ""                   # last mode we requested
     inhibited_until: float = 0.0
@@ -142,8 +149,8 @@ class Memory:
 
 @dataclass
 class Decision:
-    # "lock", "dim", "restore", "wake", "screen:hold|release", "sleep:hold|release",
-    # "sensor:active|standby"
+    # "lock", "dim", "restore", "wake", "display:off", "screen:hold|release",
+    # "sleep:hold|release", "sensor:active|standby"
     actions: list = field(default_factory=list)
     memory: Memory = Memory()
     wake_at: float = None                          # next time decide() must run, or None
@@ -183,6 +190,7 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
 
     if locked:
         hold(False, False)
+        set_mem(screen_off=False)   # the screen locker manages the screen from here
         if mem.dimmed:                          # never leave the lock screen dimmed by us
             act.append("restore"); set_mem(dimmed=False)
         if cfg.wake_on_return and sensor.ready:
@@ -200,6 +208,10 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
         return d
 
     blocked = inhibited or now < mem.inhibited_until
+
+    # Back from an absence during which we turned the screen off: turn it on.
+    if mem.screen_off and sensor.present:
+        act.append("wake"); set_mem(screen_off=False)
 
     # While you look at the screen (and for a grace period after you look
     # away), hold Plasma inhibitions so a screen that is being read is not
@@ -235,6 +247,18 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
                 set_mem(inhibited_until=now + INHIBIT_RETRY); deadline(now + INHIBIT_RETRY)
             else:
                 act.append("lock"); set_mem(locked_for_away=sensor.away_since)
+        else:
+            deadline(due)
+
+    # Screen off: away for screen_off_after seconds (once per away period).
+    # Any input, or the sensor seeing you return, turns it back on.
+    if cfg.screen_off and not sensor.present and d.memory.off_for_away != sensor.away_since:
+        due = sensor.away_since + cfg.screen_off_after
+        if now >= due:
+            if blocked:
+                set_mem(inhibited_until=now + INHIBIT_RETRY); deadline(now + INHIBIT_RETRY)
+            else:
+                act.append("display:off"); set_mem(off_for_away=sensor.away_since, screen_off=True)
         else:
             deadline(due)
     return d
@@ -328,6 +352,9 @@ class Session:
                     self._call(target, "UnInhibit", dbus.UInt32(self.cookies.pop(kind)))
             elif action == "wake":
                 subprocess.run(["kscreen-doctor", "--dpms", "on"], capture_output=True, timeout=5)
+            elif action == "display:off":
+                # KWin turns the screen back on at the next input.
+                subprocess.run(["kscreen-doctor", "--dpms", "off"], capture_output=True, timeout=5)
             elif action.startswith("sensor:"):
                 write_control(MODE_FILE, action.split(":")[1])
             self.log("action: " + action)
@@ -484,7 +511,7 @@ def main():
                     log("cannot set the sample rate: %s" % e)
                     rate_sent = cfg.sample_rate   # retried on the next config change
 
-            agent = {"locked": locked, "dimmed": mem.dimmed,
+            agent = {"locked": locked, "dimmed": mem.dimmed, "screen_off": mem.screen_off,
                      "screen_held": mem.screen_held, "sleep_held": mem.sleep_held,
                      "sensor_mode": mem.sensor_mode,
                      "config": cfg.__dict__, "inhibited": inhibited,
@@ -536,6 +563,9 @@ def _due(now, sensor, cfg, mem):
             return True
     if cfg.lock and not sensor.present and mem.locked_for_away != sensor.away_since:
         if now >= sensor.away_since + cfg.lock_after:
+            return True
+    if cfg.screen_off and not sensor.present and mem.off_for_away != sensor.away_since:
+        if now >= sensor.away_since + cfg.screen_off_after:
             return True
     return False
 

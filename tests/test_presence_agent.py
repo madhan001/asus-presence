@@ -19,10 +19,10 @@ _loader.exec_module(agent)
 
 Config, Memory, Sensor, decide = agent.Config, agent.Memory, agent.Sensor, agent.decide
 
-# The looking inhibitions are off here so the lock/dim tests see only their
-# own actions; LookingTests covers them.
+# The looking inhibitions and screen-off are off here so the lock/dim tests see
+# only their own actions; LookingTests and ScreenOffTests cover them.
 CFG = Config(enabled=True, lock=True, lock_after=60, dim=True, dim_after=10, dim_level=30,
-             keep_screen_on=False, prevent_sleep=False, wake_on_return=False)
+             keep_screen_on=False, prevent_sleep=False, wake_on_return=False, screen_off=False)
 ACTIVE = Memory(sensor_mode="active")
 T0 = 1000.0
 
@@ -87,6 +87,50 @@ class LockTests(unittest.TestCase):
 
     def test_sensor_not_ready_never_locks(self):
         d = decide(T0 + 999, Sensor(), False, CFG, ACTIVE)
+        self.assertEqual(d.actions, [])
+
+
+class ScreenOffTests(unittest.TestCase):
+    CFG = replace(CFG, lock=False, screen_off=True, screen_off_after=60)
+
+    def test_off_after_timeout_once_per_absence(self):
+        s = sensor(present=False, attention=False, away_since=T0)
+        early = decide(T0 + 59, s, False, self.CFG, ACTIVE)
+        self.assertEqual((early.actions, early.wake_at), ([], T0 + 60))
+        d = decide(T0 + 60, s, False, self.CFG, ACTIVE)
+        self.assertEqual(d.actions, ["display:off"])
+        # Woken by input while the sensor still sees nobody: don't turn it off again.
+        self.assertEqual(decide(T0 + 200, s, False, self.CFG, d.memory).actions, [])
+
+    def test_wakes_on_return(self):
+        d = decide(T0 + 60, sensor(present=False, attention=False, away_since=T0), False, self.CFG, ACTIVE)
+        back = decide(T0 + 90, sensor(present=True, attention=False, looking_away_since=T0 + 90),
+                      False, self.CFG, d.memory)
+        self.assertEqual(back.actions, ["wake"])
+        self.assertEqual(decide(T0 + 91, sensor(present=True), False, self.CFG, back.memory).actions, [])
+
+    def test_inhibitor_postpones(self):
+        s = sensor(present=False, attention=False, away_since=T0)
+        d = decide(T0 + 60, s, False, self.CFG, ACTIVE, inhibited=True)
+        self.assertEqual(d.actions, [])
+        later = decide(T0 + 60 + agent.INHIBIT_RETRY, s, False, self.CFG, d.memory)
+        self.assertEqual(later.actions, ["display:off"])
+
+    def test_with_lock_at_same_time(self):
+        cfg = replace(self.CFG, lock=True, lock_after=60)
+        d = decide(T0 + 60, sensor(present=False, attention=False, away_since=T0), False, cfg, ACTIVE)
+        self.assertEqual(d.actions, ["lock", "display:off"])
+
+    def test_locking_forgets_it(self):
+        d = decide(T0 + 60, sensor(present=False, attention=False, away_since=T0), False, self.CFG, ACTIVE)
+        locked = decide(T0 + 100, sensor(present=False, attention=False, away_since=T0), True,
+                        self.CFG, d.memory)
+        self.assertFalse(locked.memory.screen_off)
+        self.assertNotIn("wake", decide(T0 + 200, sensor(), False, self.CFG, locked.memory).actions)
+
+    def test_disabled(self):
+        cfg = replace(self.CFG, screen_off=False)
+        d = decide(T0 + 999, sensor(present=False, attention=False, away_since=T0), False, cfg, ACTIVE)
         self.assertEqual(d.actions, [])
 
 
