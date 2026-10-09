@@ -28,6 +28,7 @@ Linux and the camera LED stays off.
 
 - Linux 6.13 or newer (`hid_sensor_prox` with the attention channel).
 - Python 3.8+ with `python3-dbus`, and `gdbus` (GLib).
+- Optional: `swayidle`, for the "only when idle" option.
 - KDE Plasma 6 for the lock/dim agent. The sensor service itself works on any desktop.
 
 Tested on: ASUS ProArt PX13 (HN7306WU), Linux 7.0, Plasma 6.6.
@@ -103,6 +104,7 @@ asus-presence-ctl status     # looking, present, away, starting, standby or off
 | `keep_screen_on` | `true` | No idle dim, blank, lock or sleep while you look at the screen |
 | `prevent_sleep` | `true` | No idle sleep while you look at the screen |
 | `wake_on_return` | `false` | Keep the sensor on while locked and wake the screen when you return |
+| `only_when_idle`, `idle_after` | `false`, `30` | Pause the sensor while you use the keyboard, touchpad or touchscreen; turn it on after this many seconds without input (5 to 300). Away timers then start once the sensor is on. Needs `swayidle` |
 | `sample_rate` | `2` | Sensor reports per second (0.5 to 10). Reacts in about 2/rate seconds; higher uses more power |
 
 ## Troubleshooting

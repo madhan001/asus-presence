@@ -15,13 +15,17 @@ and, per ~/.config/asus-presence/presence.conf:
 
 It also puts the sensor in standby while the session is locked (unless
 wake_on_return needs it), so the webcam's USB link can suspend, and passes on
-the configured sample_rate. It does both by writing the service's
+the configured sample_rate. With only_when_idle, it also pauses the sensor
+while you are using the keyboard, touchpad or touchscreen (you are evidently
+there) and turns it on after idle_after seconds without input; idle and
+resume come from the compositor (ext-idle-notify, through swayidle). It does both by writing the service's
 group-writable control files: no root needed.
 
 Targets KDE Plasma 6 (org.kde.ScreenBrightness, PowerDevil's PolicyAgent).
 
 Event-driven: blocks on inotify (sensor state, config), the screen-saver's
-ActiveChanged D-Bus signal, and the next decision deadline. No polling.
+ActiveChanged D-Bus signal, swayidle's idle/resume events, and the next
+decision deadline. No polling.
 
 The decision logic is the pure function `decide()`; everything with side
 effects lives in `Session`.
@@ -72,9 +76,11 @@ class Config:
     screen_off: bool = True
     screen_off_after: int = 60   # seconds away before turning the screen off
     sample_rate: float = 2.0     # sensor reports per second (Hz)
+    only_when_idle: bool = False # pause the sensor while you are using the computer
+    idle_after: int = 30         # seconds without input before the sensor turns on
 
     LIMITS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90),
-              "screen_off_after": (10, 3600)}
+              "screen_off_after": (10, 3600), "idle_after": (5, 300)}
     FLOAT_LIMITS = {"sample_rate": (0.5, 10.0)}
 
 
@@ -92,7 +98,7 @@ def load_config(path=CONFIG_FILE, log=print):
     sec = parser["presence"]
     values = {}
     for name in ("enabled", "lock", "dim", "keep_screen_on", "prevent_sleep",
-                 "wake_on_return", "screen_off"):
+                 "wake_on_return", "screen_off", "only_when_idle"):
         try:
             values[name] = sec.getboolean(name, fallback=getattr(cfg, name))
         except ValueError:
@@ -150,14 +156,17 @@ class Memory:
 @dataclass
 class Decision:
     # "lock", "dim", "restore", "wake", "display:off", "screen:hold|release",
-    # "sleep:hold|release", "sensor:active|standby"
+    # "sleep:hold|release", "sensor:active|standby|paused"
     actions: list = field(default_factory=list)
     memory: Memory = Memory()
     wake_at: float = None                          # next time decide() must run, or None
 
 
-def decide(now, sensor, locked, cfg, mem, inhibited=False):
-    """Pure policy: given the situation, return actions and the next deadline."""
+def decide(now, sensor, locked, cfg, mem, inhibited=False, user_active=False):
+    """Pure policy: given the situation, return actions and the next deadline.
+
+    user_active: keyboard/pointer/touch input within the last idle_after seconds.
+    """
     d = Decision(memory=mem)
     act = d.actions
 
@@ -183,10 +192,21 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
             act.append("sensor:standby"); set_mem(sensor_mode="standby")
         return d
 
-    # Sensor mode: off while locked unless it is needed to wake on return.
-    want = "standby" if (locked and not cfg.wake_on_return) else "active"
+    # Sensor mode: off while locked unless it is needed to wake on return, and
+    # (optionally) paused while you are using the computer.
+    paused = cfg.only_when_idle and user_active and not locked
+    want = ("standby" if (locked and not cfg.wake_on_return)
+            else "paused" if paused else "active")
     if mem.sensor_mode != want:
         act.append("sensor:" + want); set_mem(sensor_mode=want)
+    if paused:
+        # Input means you are here: ignore the (possibly stale) sensor state,
+        # undo our dim, and drop the looking inhibitions (input resets idle).
+        hold(False, False)
+        if mem.dimmed:
+            act.append("restore"); set_mem(dimmed=False)
+        set_mem(screen_off=False)   # input already turned the screen on
+        return d
 
     if locked:
         hold(False, False)
@@ -415,6 +435,74 @@ def write_control(path, value):
     os.replace(tmp, path)
 
 
+class IdleWatch:
+    """Keyboard/pointer/touch idleness from the compositor, through swayidle.
+
+    swayidle uses the ext-idle-notify Wayland protocol: it prints "idle" after
+    `timeout` seconds without input and "active" at the next input, so this
+    costs nothing between those events. Until the first event the user counts
+    as active (the agent has just started, usually at login).
+    """
+
+    def __init__(self, log):
+        self.log = log
+        self.proc = None
+        self.timeout = None
+        self.buf = b""
+        self.active = False
+        self.warned = False
+
+    @property
+    def fd(self):
+        return self.proc.stdout.fileno() if self.proc else None
+
+    def configure(self, enabled, timeout):
+        """Start, restart or stop swayidle to match the config."""
+        if not enabled:
+            self.stop()
+            return
+        if self.proc and self.timeout == timeout:
+            return
+        self.stop()
+        try:
+            self.proc = subprocess.Popen(
+                ["stdbuf", "-oL", "swayidle", "timeout", str(timeout), "echo idle", "resume", "echo active"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            if not self.warned:
+                self.log("only_when_idle needs swayidle (apt install swayidle): %s; keeping the sensor on" % e)
+                self.warned = True
+            return
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self.timeout, self.active, self.buf = timeout, True, b""
+
+    def read(self):
+        """Handle swayidle output; returns False if it exited (treated as idle)."""
+        try:
+            chunk = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return True
+        if not chunk:
+            self.log("swayidle exited; keeping the sensor on until the config changes")
+            self.stop()
+            return False
+        self.buf += chunk
+        *lines, self.buf = self.buf.split(b"\n")
+        for line in lines:
+            if line.strip() in (b"idle", b"active"):
+                self.active = line.strip() == b"active"
+        return True
+
+    def stop(self):
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc, self.timeout, self.active = None, None, False
+
+
 class RunDirWatch:
     """Keep an inotify watch on the service's runtime directory.
 
@@ -485,6 +573,9 @@ def main():
     os.set_blocking(mon_fd, False)
     mon_buf = b""
 
+    idle = IdleWatch(log)
+    idle.configure(cfg.only_when_idle, cfg.idle_after)
+
     locked = session.locked()
     mem = Memory()
     published = None
@@ -495,9 +586,10 @@ def main():
             sensor = Sensor.from_state(read_state())
             now = time.time()
             # Ask D-Bus about inhibitors (video, presentation) only when an action is due.
-            inhibited = (cfg.enabled and not locked and sensor.ready and _due(now, sensor, cfg, mem)
+            inhibited = (cfg.enabled and not locked and sensor.ready and not (cfg.only_when_idle and idle.active)
+                         and _due(now, sensor, cfg, mem)
                          and session.inhibited())
-            d = decide(now, sensor, locked, cfg, mem, inhibited)
+            d = decide(now, sensor, locked, cfg, mem, inhibited, user_active=idle.active)
             for action in d.actions:
                 session.apply(action, cfg)
             mem = d.memory
@@ -512,6 +604,7 @@ def main():
                     rate_sent = cfg.sample_rate   # retried on the next config change
 
             agent = {"locked": locked, "dimmed": mem.dimmed, "screen_off": mem.screen_off,
+                     "user_active": idle.active,
                      "screen_held": mem.screen_held, "sleep_held": mem.sleep_held,
                      "sensor_mode": mem.sensor_mode,
                      "config": cfg.__dict__, "inhibited": inhibited,
@@ -528,7 +621,13 @@ def main():
             poll = run_dir.refresh()
             if poll is not None:
                 timeout = poll if timeout is None else min(timeout, poll)
-            r, _, _ = select.select([notify.fd, mon_fd, stop_r], [], [], timeout)
+            fds = [notify.fd, mon_fd, stop_r] + ([idle.fd] if idle.fd is not None else [])
+            r, _, _ = select.select(fds, [], [], timeout)
+            if idle.fd is not None and idle.fd in r:
+                was = idle.active
+                idle.read()
+                if idle.active != was:
+                    log("input: %s" % ("active" if idle.active else "idle"))
             if stop_r in r:
                 break
             if mon_fd in r:
@@ -546,6 +645,7 @@ def main():
             if notify.fd in r and CONFIG_FILE in notify.drain():
                 cfg = load_config(log=log)
                 log("config reloaded: %s" % (cfg,))
+                idle.configure(cfg.only_when_idle, cfg.idle_after)
     finally:
         if mem.dimmed:
             session.apply("restore", cfg)
@@ -553,6 +653,7 @@ def main():
             if held:
                 session.apply(kind + ":release", cfg)
         monitor.terminate()
+        idle.stop()
     return 0
 
 

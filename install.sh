@@ -30,6 +30,7 @@ done
 [[ -n "${found}" ]] || warn "no presence sensor with an attention channel found (needs the webcam sensor and Linux 6.13+); installing anyway"
 command -v plasmashell >/dev/null || warn "KDE Plasma not found: the sensor service works, but the lock/dim agent targets Plasma 6"
 command -v kscreen-doctor >/dev/null || warn "kscreen-doctor not found: 'wake on return' will not work"
+command -v swayidle >/dev/null || warn "swayidle not found: the optional \"only when idle\" setting needs it (apt install swayidle)"
 
 say "Installing system files"
 getent group "${GROUP}" >/dev/null || sudo groupadd --system "${GROUP}"

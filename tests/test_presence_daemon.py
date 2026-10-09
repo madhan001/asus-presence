@@ -111,6 +111,11 @@ class ControlFileTests(unittest.TestCase):
             f.write("standby\n")
         self.assertEqual(daemon.wanted_mode(), "standby")
 
+    def test_paused(self):
+        with open(self.mode_file, "w") as f:
+            f.write("paused\n")
+        self.assertEqual(daemon.wanted_mode(), "paused")
+
     def test_garbage_means_active(self):
         with open(self.mode_file, "w") as f:
             f.write("x" * 100000)

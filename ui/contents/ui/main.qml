@@ -23,7 +23,7 @@ PlasmoidItem {
     property var history: []        // [{t, distance, present, attention}]
     property bool busy: false
     property string lastError: ""
-    property string trayStatus: "off"   // looking, present, away, starting, standby, off
+    property string trayStatus: "off"   // looking, present, away, starting, paused, standby, off
     property string trayEnabled: ""     // "on"/"off" once known; whether the tray shows us
 
     readonly property var sensor: st.sensor || {}
@@ -32,10 +32,14 @@ PlasmoidItem {
     readonly property bool serviceOn: st.service === "active"
     readonly property bool ready: serviceOn && sensor.sensor_ready === true
 
-    readonly property bool inWindow: Plasmoid.formFactor === PlasmaCore.Types.Planar
+    // Own window (plasmawindowed: Application) or on the desktop (Planar): the full
+    // view. In a panel or the system tray: the eyes.
+    readonly property bool inWindow: Plasmoid.formFactor === PlasmaCore.Types.Application
+                                     || Plasmoid.formFactor === PlasmaCore.Types.Planar
     readonly property var statusTexts: ({
         looking: "Looking at the screen", present: "Present, looking away", away: "Away",
-        starting: "Starting sensor…", standby: "Sensor in standby", off: "Sensor off"
+        starting: "Starting sensor…", paused: "Paused while you use the computer",
+        standby: "Sensor in standby", off: "Sensor off"
     })
 
     preferredRepresentation: inWindow ? fullRepresentation : compactRepresentation
@@ -80,9 +84,9 @@ PlasmoidItem {
         onClicked: root.expanded = !root.expanded
 
         // Two eyes: open and looking at you, glancing aside, or closed (away);
-        // faded while the sensor is not reporting.
+        // faded while the sensor is not reporting (open while paused: you are here).
         readonly property bool open: root.trayStatus === "looking" || root.trayStatus === "present"
-                                     || root.trayStatus === "starting"
+                                     || root.trayStatus === "starting" || root.trayStatus === "paused"
         readonly property real glance: root.trayStatus === "present" ? 1 : 0
         readonly property real s: Math.min(width, height) * 0.9
         opacity: root.trayStatus === "looking" || root.trayStatus === "present" || root.trayStatus === "away" ? 1 : 0.45
@@ -157,6 +161,9 @@ PlasmoidItem {
         }
         if (sensor.mode === "standby") {
             return "Sensor in standby";
+        }
+        if (sensor.mode === "paused") {
+            return "Paused while you use the computer";
         }
         if (!sensor.sensor_ready) {
             return "Starting sensor…";
@@ -446,8 +453,23 @@ PlasmoidItem {
                         opacity: 0.7
                         elide: Text.ElideRight
                     }
-                    PlasmaComponents3.CheckBox {
+                    RowLayout {
                         Layout.topMargin: Kirigami.Units.smallSpacing
+                        enabled: !root.busy
+                        PlasmaComponents3.CheckBox {
+                            text: "Only when idle: turn it on after"
+                            checked: root.cfg.only_when_idle === true
+                            onToggled: root.setting("only_when_idle", checked)
+                        }
+                        PlasmaComponents3.SpinBox {
+                            from: 5; to: 300; stepSize: 5
+                            enabled: root.cfg.only_when_idle === true
+                            value: root.cfg.idle_after || 30
+                            onValueModified: root.setting("idle_after", value)
+                        }
+                        PlasmaComponents3.Label { text: "s without input" }
+                    }
+                    PlasmaComponents3.CheckBox {
                         text: "Show the status in the system tray"
                         visible: root.trayEnabled !== ""
                         enabled: !root.busy

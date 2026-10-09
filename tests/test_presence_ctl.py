@@ -25,6 +25,7 @@ class StatusTests(unittest.TestCase):
 
     def test_standby_and_starting(self):
         self.assertEqual(ctl.status(dict(ACTIVE, mode="standby")), "standby")
+        self.assertEqual(ctl.status(dict(ACTIVE, mode="paused", sensor=None)), "paused")
         self.assertEqual(ctl.status(dict(ACTIVE, sensor_ready=False)), "starting")
 
     def test_presence(self):

@@ -3,7 +3,8 @@
 
   asus-presence-ctl get              one JSON document for the test UI
   asus-presence-ctl set KEY VALUE    validated update of ~/.config/asus-presence/presence.conf
-  asus-presence-ctl status           one word: looking, present, away, starting, standby or off
+  asus-presence-ctl status           one word: looking, present, away, starting, paused,
+                                     standby or off
   asus-presence-ctl wait STATUS      block until the status differs from STATUS (at most
                                      WAIT_MAX seconds), then print it; the tray icon's long poll
   asus-presence-ctl tray on|off|get  show the Presence Sensor in Plasma's system tray
@@ -28,9 +29,10 @@ WAIT_MAX = 600   # seconds; the caller simply waits again
 PLASMOID = "asus-presence"
 AGENT_FILE = os.path.expanduser("~/.cache/asus-presence/agent.json")
 
-BOOLS = {"enabled", "lock", "dim", "keep_screen_on", "prevent_sleep", "wake_on_return", "screen_off"}
+BOOLS = {"enabled", "lock", "dim", "keep_screen_on", "prevent_sleep", "wake_on_return", "screen_off",
+         "only_when_idle"}
 INTS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90),
-        "screen_off_after": (10, 3600)}
+        "screen_off_after": (10, 3600), "idle_after": (5, 300)}
 FLOATS = {"sample_rate": (0.5, 10.0)}
 
 
@@ -90,10 +92,12 @@ def set_value(key, value):
 
 def status(state):
     """The sensor state as one word (what the tray icon shows)."""
-    if not state or state.get("mode") not in ("active", "standby") or not state.get("sensor"):
+    if not state or state.get("mode") not in ("active", "standby", "paused"):
         return "off"
-    if state["mode"] == "standby":
-        return "standby"
+    if state["mode"] in ("standby", "paused"):
+        return state["mode"]
+    if not state.get("sensor"):
+        return "off"
     if not state.get("sensor_ready"):
         return "starting"
     if not state.get("present"):

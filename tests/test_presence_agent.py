@@ -134,6 +134,41 @@ class ScreenOffTests(unittest.TestCase):
         self.assertEqual(d.actions, [])
 
 
+class OnlyWhenIdleTests(unittest.TestCase):
+    CFG = replace(CFG, only_when_idle=True)
+
+    def test_paused_while_using_the_computer(self):
+        d = decide(T0, sensor(), False, self.CFG, ACTIVE, user_active=True)
+        self.assertEqual(d.actions, ["sensor:paused"])
+
+    def test_turns_on_when_idle(self):
+        d = decide(T0, Sensor(mode="paused"), False, self.CFG, Memory(sensor_mode="paused"), user_active=False)
+        self.assertEqual(d.actions, ["sensor:active"])
+
+    def test_input_restores_dim_and_drops_holds(self):
+        cfg = replace(self.CFG, keep_screen_on=True, prevent_sleep=True)
+        mem = replace(ACTIVE, dimmed=True, screen_held=True, sleep_held=True, screen_off=True)
+        d = decide(T0, sensor(), False, cfg, mem, user_active=True)
+        self.assertEqual(sorted(d.actions), sorted(["sensor:paused", "screen:release", "sleep:release", "restore"]))
+        self.assertFalse(d.memory.screen_off)
+
+    def test_stale_sensor_state_never_dims_or_locks_while_typing(self):
+        # The service has not caught up yet: the state still says "away" / "looking away".
+        away = sensor(present=False, attention=False, away_since=T0 - 999)
+        looking_away = sensor(present=True, attention=False, looking_away_since=T0 - 999)
+        for s in (away, looking_away):
+            d = decide(T0, s, False, self.CFG, Memory(sensor_mode="paused"), user_active=True)
+            self.assertEqual(d.actions, [])
+
+    def test_locked_means_standby(self):
+        d = decide(T0, sensor(), True, self.CFG, ACTIVE, user_active=True)
+        self.assertIn("sensor:standby", d.actions)
+
+    def test_option_off_ignores_input(self):
+        d = decide(T0, sensor(), False, CFG, ACTIVE, user_active=True)
+        self.assertNotIn("sensor:paused", d.actions)
+
+
 class LockedSessionTests(unittest.TestCase):
     def test_locked_puts_sensor_in_standby_and_restores_dim(self):
         d = decide(T0, sensor(), True, CFG, replace(ACTIVE, dimmed=True))

@@ -30,7 +30,8 @@ only by root and the service's group (asus-presence).
 
 Files (RUN_DIR is the service's RuntimeDirectory, root:asus-presence 0750):
   state.json     published state, mode 0640 (written only when it changes)
-  control/mode   "active" (default) or "standby" (sensor off)
+  control/mode   "active" (default), "standby" (sensor off: session locked) or
+                 "paused" (sensor off: you are using the computer)
   control/rate   report rate in Hz (RATE_MIN..RATE_MAX; default ASUS_PRESENCE_HZ
                  or 2), applied while streaming without restarting the sensor
   The control directory is group-writable so the session agent can switch
@@ -286,9 +287,12 @@ def read_control(path):
         os.close(fd)
 
 
+OFF_MODES = ("standby", "paused")   # both turn the sensor off; the name says why
+
+
 def wanted_mode():
     mode = read_control(MODE_FILE)
-    return mode if mode in ("active", "standby") else "active"
+    return mode if mode in ("active",) + OFF_MODES else "active"
 
 
 def wanted_rate():
@@ -311,11 +315,13 @@ def run(presence, notify):
     retry = RETRY_MIN
     working = None   # the device that last delivered samples; tried first, without probing
     while True:
-        if wanted_mode() == "standby":
-            presence.state["mode"] = "standby"
+        mode = wanted_mode()
+        if mode in OFF_MODES:
+            if presence.state["mode"] != mode:
+                log("%s: sensor off" % mode)
+            presence.state["mode"] = mode
             presence.reset()
             presence.publish()
-            log("standby: sensor off")
             wait([notify.fd], None)
             notify.drain()
             continue

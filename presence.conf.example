@@ -27,6 +27,13 @@ prevent_sleep = true
 # Keep the sensor on while locked and wake the screen when you return.
 # Off by default: costs a little power while the session is locked.
 wake_on_return = false
+# Only turn the sensor on after idle_after seconds (5..300) without keyboard,
+# touchpad or touch input, and pause it while you use the computer: input
+# already shows you are there. Saves power. Away timers start once the sensor
+# is on, so a lock happens about idle_after + lock_after seconds after you
+# leave. Keep idle_after below Plasma's own dim timeout. Needs swayidle.
+only_when_idle = false
+idle_after = 30
 # How often the sensor reports, in Hz (0.5..10). Presence and attention must
 # hold for two reports, so this sets how quickly it reacts (about 2/rate
 # seconds); higher rates use more power. Applied live.
